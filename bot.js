@@ -7,9 +7,9 @@ const puppeteer   = require('puppeteer');
 // ============================================================
 //  CONFIG
 // ============================================================
-const BOT_TOKEN    = "8919251343:AAHkxorWhQbfBeTQ0YdmY1Ao26tttjV3W20";
-const OWNER_ID     = 1865939951;
-const OWNER_PASS   = "praveensaran";
+const BOT_TOKEN    = "8204417780:AAGq6iIpu0RP4qGCf3XkN4zGYhtbtKlWpOo";
+const OWNER_ID     = 8321379592;
+const OWNER_PASS   = "2004";
 const ADMIN_HANDLE = "@lucifer1570";
 const REG_LINK     = "https://bdgwinuu.com/#/register?invitationCode=7442815992780";
 const WIN_STICKER  = "CAACAgUAAxkBAAFHUGNp4JX1-ohP4uBEWpfNptaz-HmwVgAC4hgAAhboKVbObuGuTcMs2zsE";
@@ -71,7 +71,7 @@ let autobetCfg     = {};
 let autobetState   = {};
 let profitTrack    = {};
 let GLOBAL_TOKEN   = "";
-let userTokens = {}; 
+
 let userStates = {};
 
 const predictionState = {
@@ -358,8 +358,9 @@ async function fetchCaptcha() {
 
 // ============================================================
 //  AUTO LOGIN (PUPPETEER VERSION)
-// ============================================================
 let loginLock = {};
+let userTokens = {}; // Assuming userTokens is managed externally
+
 
 async function autoLogin(userId, chatId, silent = false) {
     if (loginLock[userId]) {
@@ -395,6 +396,7 @@ async function autoLogin(userId, chatId, silent = false) {
             }
             req.continue();
         });
+
 
         await page.goto('https://bdgwin901.com/#/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
         await page.waitForSelector('input', { timeout: 30000 });
@@ -705,8 +707,8 @@ function processAndAppend(apiData) {
         return String(b.period).localeCompare(String(a.period));
     });
 
-    if (predictionState.history.length > 500) {
-        predictionState.history = predictionState.history.slice(0, 500);
+    if (predictionState.history.length > 50) {
+        predictionState.history = predictionState.history.slice(0, 50);
     }
 
     predictionState.stats.totalFetched += rawResults.length;
@@ -743,110 +745,101 @@ async function fetchAndStoreHistory() {
     }
 }
 
+
 function predictSizeOnly(historicalData) {
-    if (!Array.isArray(historicalData) || historicalData.length < 4) {
+    // We use up to 500 history entries stored in predictionState.history
+    const data = historicalData || predictionState.history;
+    
+    if (!Array.isArray(data) || data.length < 5) {
         return {
             signal: false,
             type: 'no_signal',
-            reason: `Need 4+ results, have ${historicalData ? historicalData.length : 0}`,
+            reason: `Need more history, have ${data ? data.length : 0}`,
             shouldSkip: true
         };
     }
 
-    const current = historicalData[0];
+    const current = data[0];
     const currentNum = Number(current.number ?? current.winNumber ?? current.result ?? current);
-    const currentSize = SIZE_MAP[String(currentNum)] || (currentNum >= 5 ? 'Big' : 'Small');
-
+    
+    let bigCount = 0;
+    let smallCount = 0;
     const matches = [];
-    for (let i = 1; i < historicalData.length; i++) {
-        const entry = historicalData[i];
+
+    // Analyze all available history (up to 500)
+    for (let i = 1; i < data.length; i++) {
+        const entry = data[i];
         const entryNum = Number(entry.number ?? entry.winNumber ?? entry.result ?? 0);
-        if (Number(entryNum) === Number(currentNum)) {
-            const nextEntry = historicalData[i - 1] || {};
-            const nextNum = Number(nextEntry.number ?? nextEntry.winNumber ?? nextEntry.result ?? 0);
-            const nextSize = SIZE_MAP[String(nextNum)] || (nextNum >= 5 ? 'Big' : 'Small');
-            matches.push({
-                index: i,
-                period: entry.period || i,
-                result: entryNum,
-                nextSize: nextSize,
-                nextResult: nextNum
-            });
+        
+        if (entryNum === currentNum) {
+            const nextEntry = data[i - 1]; 
+            if (nextEntry) {
+                const nextNum = Number(nextEntry.number ?? nextEntry.winNumber ?? nextEntry.result ?? 0);
+                const nextSize = SIZE_MAP[String(nextNum)] || (nextNum >= 5 ? 'Big' : 'Small');
+                
+                matches.push({
+                    period: entry.period,
+                    nextSize: nextSize
+                });
+
+                if (nextSize === 'Big') bigCount++;
+                else if (nextSize === 'Small') smallCount++;
+            }
         }
     }
 
-    if (matches.length === 0) {
+    // Minimum 2 matches in 500 history to make a probability guess
+    if (matches.length < 2) {
         return {
             signal: false,
             type: 'no_signal',
-            reason: `No previous occurrences of ${currentNum} found`,
-            matches: [],
+            reason: `Only ${matches.length} matches for ${currentNum} in history.`,
             shouldSkip: true
         };
     }
 
-    if (matches.length < 3) {
+    const totalMatches = bigCount + smallCount;
+    const bigProb = (bigCount / totalMatches) * 100;
+    const smallProb = (smallCount / totalMatches) * 100;
+
+    let predictedSize = '';
+    let predictedValue = '';
+    let confidence = 0;
+
+    if (bigCount > smallCount) {
+        predictedSize = 'Big';
+        predictedValue = 'BIG';
+        confidence = bigProb;
+    } else if (smallCount > bigCount) {
+        predictedSize = 'Small';
+        predictedValue = 'SMALL';
+        confidence = smallProb;
+    } else {
         return {
             signal: false,
-            type: 'no_signal',
-            reason: `Only ${matches.length} previous occurrences, need at least 3`,
-            matches: matches,
+            type: 'skip',
+            reason: `Equal Prob (B:${bigCount}, S:${smallCount})`,
             shouldSkip: true
-        };
-    }
-
-    const latest3 = matches.slice(0, 3);
-    const sizes = latest3.map(m => m.nextSize);
-
-    if (sizes.every(s => s === 'Big')) {
-        const predictedSize = 'Small';
-        const predictedValue = 'SMALL';
-        return {
-            signal: true,
-            type: 'predict_size',
-            val: predictedValue,
-            prediction: { size: predictedSize },
-            reason: `SIZE: ${sizes.join(', ')} → ${predictedSize}`,
-            matchedSize: sizes[0],
-            predictedSize: predictedSize,
-            shouldSkip: false,
-            matches: latest3,
-            history: sizes.join(', '),
-            currentNumber: currentNum,
-            currentSize: currentSize
-        };
-    }
-
-    if (sizes.every(s => s === 'Small')) {
-        const predictedSize = 'Big';
-        const predictedValue = 'BIG';
-        return {
-            signal: true,
-            type: 'predict_size',
-            val: predictedValue,
-            prediction: { size: predictedSize },
-            reason: `SIZE: ${sizes.join(', ')} → ${predictedSize}`,
-            matchedSize: sizes[0],
-            predictedSize: predictedSize,
-            shouldSkip: false,
-            matches: latest3,
-            history: sizes.join(', '),
-            currentNumber: currentNum,
-            currentSize: currentSize
         };
     }
 
     return {
-        signal: false,
-        type: 'skip',
-        reason: `SKIP: Next sizes are mixed (${sizes.join(', ')})`,
-        shouldSkip: true,
-        matches: latest3,
-        history: sizes.join(', '),
+        signal: true,
+        type: 'predict_size',
+        val: predictedValue,
+        prediction: { size: predictedSize },
+        reason: `${predictedSize} (${confidence.toFixed(1)}%) | ${totalMatches} matches`,
+        matchedSize: predictedSize,
+        predictedSize: predictedSize,
+        shouldSkip: false,
+        matches: matches.slice(0, 5),
+        history: `B:${bigCount} | S:${smallCount}`,
         currentNumber: currentNum,
-        currentSize: currentSize
+        confidence: confidence.toFixed(1),
+        totalMatches: totalMatches
     };
 }
+
 
 function decidePrediction(list) {
     if (Array.isArray(list) && list.length > 0) return predictSizeOnly(list);
@@ -1187,6 +1180,71 @@ async function checkResult(userId, chatId, target, predicted, predType, betPlace
         setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 8000);
     }, 10000);
 }
+
+
+// ============================================================
+//  STATS
+// ============================================================
+function showStats(chatId,userId){
+    const d=stats[userId],rate=d.total?((d.win/d.total)*100).toFixed(1):"0.0";
+    const bar="🟦".repeat(d.total?Math.round(d.win/d.total*10):0)+"⬜".repeat(d.total?10-Math.round(d.win/d.total*10):10);
+    send(chatId,"📊 STATS\n\nTotal: "+d.total+"\nWins: "+d.win+"\nLosses: "+d.loss+"\nAcc: "+rate+"%\n"+bar+"\n\nBest Win: "+d.maxWinStreak+" streak\nWorst Loss: "+d.maxLossStreak+" streak");
+}
+function profitReport(chatId,userId){
+    const pt=profitTrack[userId],cfg=autobetCfg[userId];
+    const rate=pt.totalBets?((pt.wins/pt.totalBets)*100).toFixed(1):"0.0";
+    const amounts=cfg.customBets.slice(0,cfg.maxLvl);
+    send(chatId,
+"💰 PROFIT REPORT\n\n"+
+"Bets  : "+pt.totalBets+"\nWins  : "+pt.wins+"\nLoss  : "+pt.losses+"\nRate  : "+rate+"%\n"+
+"P&L   : "+(pt.pnl>=0?"+":"")+pt.pnl.toFixed(2)+"\n"+
+"Best W: "+pt.maxW+" | Worst L: "+pt.maxL+"\n\n"+
+"Mart: ₹"+amounts.join("→₹")
+    );
+}
+async function autobetStatus(chatId, userId) {
+    const cfg = autobetCfg[userId], st = autobetState[userId], pt = profitTrack[userId];
+    const amounts = cfg.customBets.slice(0, cfg.maxLvl);
+    const creds = userCreds[userId] || {};
+    
+    let liveBal = "❌ Login Required";
+    let token = getToken(userId);
+    if (token && token.length > 20) {
+        const balance = await getLiveBalance(userId);
+        if (balance !== null) {
+            liveBal = "₹" + Number(balance).toFixed(2);
+        } else {
+            liveBal = "⚠️ Token Expired";
+        }
+    }
+
+    let waitLine = "";
+    if (st.isWaiting) {
+        const diff = Math.round((st.nextStartTime - Date.now()) / 60000);
+        waitLine = "\n⏳ Waiting: " + diff + " mins to restart";
+    }
+
+    send(chatId,
+"🤖 AUTOBET STATUS\n\n"+
+"💰 Live Balance: "+liveBal+"\n"+
+"Enabled  : "+(cfg.enabled?"✅ ON":"❌ OFF")+"\n"+
+"Token    : "+(token.length>20?"✅":"❌")+"\n"+
+"AutoLogin: "+(creds.phone?"✅ "+creds.phone.slice(0,6)+"***":"❌")+"\n"+
+"Watch    : "+(cfg.watch?"ON":"OFF")+"\n"+
+"WatchLoss: "+st.consecutiveLoss+"/"+cfg.watchLoss+"\n"+
+"Base Bet : ₹"+cfg.baseBet+"\n"+
+"Max Level: "+cfg.maxLvl+"\n"+
+"Target Profit: ₹"+cfg.targetProfit+"\n"+
+"Section Delay: "+cfg.restartDelay+" mins"+ // Hours-la irunthu Minutes-ku mathi irukken
+waitLine+"\n"+
+"In Mart  : "+(st.inMart?"YES":"NO")+"\n"+
+"P&L      : "+(pt.pnl>=0?"+":"")+pt.pnl.toFixed(2)+"\n\n"+
+"Mart: ₹"+amounts.join("→₹")
+    );
+}
+
+
+
 
 
 // ============================================================
@@ -1622,44 +1680,76 @@ if(text==="🔢 Set Watch Losses"){
             return send(id,"Token: "+(tok.length>20?"✅ ..."+tok.slice(-12):"❌")+"\nLogin: "+(creds.phone?"✅ "+creds.phone.slice(0,6)+"***":"❌")+"\n\n/setcreds FULLPHONE PASSWORD\n/setmytoken TOKEN\n/login — Test");
         }
 
-      if(text==="▶️ Start Prediction"){
-            if(!hasAccess(id))return send(msg.chat.id,"❌ No access!\n📩 "+ADMIN_HANDLE+"\nID: "+id);
-            if(running[id])return send(msg.chat.id,"⚠️ Already running!");
-            if(!getToken(id)&&userCreds[id]?.phone){await send(msg.chat.id,"🔄 Auto login...");await autoLogin(id,msg.chat.id,true);}
-            running[id]=true;sentPeriods[id]=new Set();
-            autobetState[id]={level:1,consecutiveLoss:0,inMart:false};
+     if(text==="▶️ Start Prediction"){
+    if(!hasAccess(id)) return send(msg.chat.id,"❌ No access!\n📩 "+ADMIN_HANDLE+"\nID: "+id);
+    if(running[id]) return send(msg.chat.id,"⚠️ Already running!");
+    if(!getToken(id) && userCreds[id]?.phone) {
+        await send(msg.chat.id,"🔄 Auto login...");
+        await autoLogin(id, msg.chat.id, true);
+    }
+    
+    running[id] = true;
+    sentPeriods[id] = new Set();
+    autobetState[id] = { level: 1, consecutiveLoss: 0, inMart: false };
 
-            // Load previous B/S history from API
-            const prevList = await fetchList();
-            initState(id);
+    // 1. Load previous history from API
+    const prevList = await fetchList();
+    const rawResults = extractResultsArray(prevList) || prevList;
+    initState(id);
 
-            if (prevList && prevList.length >= 4) {
-                // Build B/S history
-                userStates[id].resultHistory = buildBSFromList(prevList, 15);
-                await send(msg.chat.id, "📋 Loaded history: " + (userStates[id].resultHistory || []).join(''));
+    if (rawResults && rawResults.length >= 50) {
+        // 2. Build B/S history (up to 50 items)
+        userStates[id].resultHistory = buildBSFromList(rawResults, 50);
+        const hist = userStates[id].resultHistory;
+        
+        await send(msg.chat.id, "📋 Loaded history (Last " + hist.length + "): " + hist.join(''));
 
-                // ─── SSBB / BBSS PATTERN CHECK ───
-                // Last 4 results check (oldest first in array, so last 4 = end of array)
-                const hist = userStates[id].resultHistory;
-                if (hist.length >= 4) {
-                    const last4 = hist.slice(-4).join('');
-                    if (last4 === 'SSBB' || last4 === 'BBSS' || last4 === 'SSSB' || last4 === 'BBBS' || last4 === 'SBBS' || last4 === 'BSSB') {
-                        userStates[id].skipCount = 4;
-                        await send(msg.chat.id, 
-                            "⚠️ Pattern Detected: " + last4 + "\n" +
-                            "🚫 Skipping next 4 periods...\n" +
-                            "💡 Prediction will resume after skip."
-                        );
-                    }
+        // 3. ✅ 50 History Full Scan for Patterns
+        if (hist.length >= 50) {
+            const dangerousPatterns = ['SSBB', 'BBSS', 'SSSB', 'BBBS', 'SBBS', 'BSSB'];
+            let matchedCount = 0;
+            let lastMatchedPattern = '';
+
+            // Loop through the 50 history to find matching 4-character blocks
+            for (let i = 0; i <= hist.length - 50; i++) {
+                const chunk = hist.slice(i, i + 50).join('');
+                if (dangerousPatterns.includes(chunk)) {
+                    matchedCount++;
+                    lastMatchedPattern = chunk;
                 }
             }
 
-            const cfg=autobetCfg[id];
-            await send(msg.chat.id,
-"🚀 ENGINE ON!\n\nAutoBet: "+(cfg.enabled?"✅ ON":"❌ OFF")+"\nWatch  : "+(cfg.watch?"ON ("+cfg.watchLoss+"L)":"OFF")+"\nBase   : ₹"+cfg.baseBet+" | MaxLvl: "+cfg.maxLvl
-            );
-            runPredict(id,msg.chat.id);
+            // If any dangerous pattern exists within the 50 history and the VERY LATEST block is also dangerous
+            const latest50 = hist.slice(-50).join('');
+            if (dangerousPatterns.includes(latest50)) {
+                userStates[id].skipCount = 0; // ✅ Fixed: Set to 4 to actually skip 4 periods!
+                await send(msg.chat.id, 
+                    "⚠️ **Pattern Detected in 50 History Scan!**\n" +
+                    "🔍 Latest Pattern: " + latest50 + "\n" +
+                    "📊 Total matches in 50 history: " + matchedCount + "\n" +
+                    "🚫 Skipping next 4 periods...\n" +
+                    "💡 Prediction will resume after skip."
+                );
+            } else if (matchedCount > 0) {
+                await send(msg.chat.id, 
+                    "🔍 50 history-la total-ah " + matchedCount + " dangerous patterns irukku (Last match: " + lastMatchedPattern + ").\n" +
+                    "✅ But current latest 4 (" + latest4 + ") is Safe. Starting normal prediction..."
+                );
+            } else {
+                await send(msg.chat.id, "✅ 50 History fully scanned. No dangerous patterns found. Safe to start!");
+            }
         }
+    } else {
+        await send(msg.chat.id, "⚠️ Warning: Could not fetch enough history to check patterns.");
+    }
+
+    const cfg = autobetCfg[id];
+    await send(msg.chat.id,
+        "🚀 ENGINE ON!\n\nAutoBet: "+(cfg.enabled?"✅ ON":"❌ OFF")+"\nWatch  : "+(cfg.watch?"ON ("+cfg.watchLoss+"L)":"OFF")+"\nBase   : ₹"+cfg.baseBet+" | MaxLvl: "+cfg.maxLvl
+    );
+    
+    runPredict(id, msg.chat.id);
+}
         if(text==="🛑 Stop")   {running[id]=false;send(msg.chat.id,"🛑 Stopped.");}
         if(text==="📊 Stats")  showStats(msg.chat.id,id);
         if(text==="💰 Profit") profitReport(msg.chat.id,id);
