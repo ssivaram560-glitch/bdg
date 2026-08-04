@@ -496,7 +496,6 @@ return false;
 // ============================================================
 //  LOGIC (SAME / OPPOSITE MODE — 3 LEVEL)
 // ============================================================
-
 // ════════════════════════════════════════════════════════════════════
 //  INIT STATE — Safe
 // ════════════════════════════════════════════════════════════════════
@@ -803,7 +802,7 @@ function decidePrediction(list) {
 }
 
 
-// 1. updateAfterResult - Corrected Level Management
+// 1. updateAfterResult - Corrected Level Management & Skip Logic
 function updateAfterResult(userId, wasWin, actualSize, betPlaced) {
     initState(userId);
     const state = userStates[userId];
@@ -815,8 +814,6 @@ function updateAfterResult(userId, wasWin, actualSize, betPlaced) {
     if (state.resultHistory.length > 20) state.resultHistory.shift();
 
     if (!betPlaced) {
-        // No bet was placed: do not change the current martingale level.
-        // Watch mode still tracks prediction losses until the trigger condition is met.
         if (!st.inMart && cfg.watch) {
             if (wasWin) st.consecutiveLoss = 0;
             else st.consecutiveLoss++;
@@ -831,6 +828,13 @@ function updateAfterResult(userId, wasWin, actualSize, betPlaced) {
         st.inMart = false;
     } else {
         st.consecutiveLoss++;
+        
+        // 👈 Fixed: Trigger 3 skips immediately if we lost at Level 3
+        if (st.level === 3) {
+            state.skipCount = 3;
+            console.log(`[USER ${userId}] L3 Loss detected -> Setting skipCount to 3.`);
+        }
+
         st.inMart = true;
         st.level++;
 
@@ -842,12 +846,11 @@ function updateAfterResult(userId, wasWin, actualSize, betPlaced) {
         }
 
         // --- L4 ENTRY CHECK (Safety) ---
-        // Only check patterns when entering Level 4 (after L3 loss)
         if (st.level === 4) {
             const last4 = state.resultHistory.slice(-4).join('');
             const dangerousPatterns = ['SSBB', 'BBSS', 'SSSB', 'BBBS', 'SBBS', 'BSSB'];
             if (dangerousPatterns.includes(last4)) {
-                state.skipCount = 4;
+                state.skipCount = Math.max(state.skipCount, 4);
                 console.log(`[USER ${userId}] Dangerous Pattern ${last4} at L4 Entry -> Skipping 4.`);
             }
         }
@@ -985,10 +988,10 @@ async function runPredict(userId, chatId) {
     let abLine = "🤖 AutoBet: OFF";
     let canBet = cfg.enabled;
 
-    // --- WATCH LOSS LOGIC ---
+    // --- SKIP & WATCH LOGIC ---
     if (state.skipCount > 0) {
         abLine = `⏭️ SKIP BET (${state.skipCount} left)`;
-        state.skipCount--;
+        state.skipCount--; // 👈 Decrements each skip period properly
         canBet = false;
     } else if (cfg.watch && !st.inMart) {
         abLine = `👀 WATCHING: ${st.consecutiveLoss}/${cfg.watchLoss}`;
@@ -1000,7 +1003,7 @@ async function runPredict(userId, chatId) {
 
     await send(chatId,
 "╔══════════════════════════╗\n"+
-"║   👑 EARN WITH ME AI    ║\n"+
+"║    👑 EARN WITH ME AI    ║\n"+
 "╠══════════════════════════╣\n"+
 "║ Period  : "+next.slice(-6)+"\n"+
 "║ Signal  : "+(signal.val==="BIG"?"🔵 BIG":"🟠 SMALL")+"\n"+
@@ -1016,7 +1019,6 @@ async function runPredict(userId, chatId) {
         const result = await placeBet(userId, chatId, next, signal.val, signal.type, st.level);
         if (result && result.ok) {
             betPlaced = true;
-            // இதோ இந்த மெசேஜ் தான் பெட் கட்டியவுடன் வரும்
             await send(chatId, "✅ Bet Success! ₹" + result.amt + " L" + st.level + "\n⏳ Checking result...");
         } else if (result && !result.ok) {
             await send(chatId, "❌ Bet Failed: " + (result.msg || "Unknown error"));
@@ -1028,7 +1030,6 @@ async function runPredict(userId, chatId) {
 // ============================================================
 //  RESULT CHECKER
 // ============================================================
-
 
 // 4. checkResult - Robust Update & Full UI
 async function checkResult(userId, chatId, target, predicted, predType, betPlaced) {
@@ -1056,9 +1057,8 @@ async function checkResult(userId, chatId, target, predicted, predType, betPlace
         else actual = num === 0 ? "RED" : num === 5 ? "GREEN" : num % 2 === 0 ? "RED" : "GREEN";
         
         const win = predicted === actual;
-        const betLevel = st.level; // Save current level before update
+        const betLevel = st.level;
 
-        // UPDATE LOGIC (Passing betPlaced to fix L1 repetition)
         updateAfterResult(userId, win, actual, betPlaced);
 
         const s = stats[userId];
@@ -1072,18 +1072,15 @@ async function checkResult(userId, chatId, target, predicted, predType, betPlace
         }
 
         if (betPlaced) {
-            // BET RESULT DASHBOARD
             if (win) await handleWin(userId, chatId, actual, num, betLevel);
             else await handleLoss(userId, chatId, actual, num, betLevel);
 
-            // Profit Check
             if (pt.pnl >= cfg.targetProfit) {
                 st.isWaiting = true;
                 st.nextStartTime = Date.now() + (cfg.restartDelay * 60 * 1000); 
                 await send(chatId, "🎯 TARGET REACHED! Bot Paused.");
             }
         } else {
-            // WATCH RESULT DASHBOARD (Full details as requested)
             if (win) {
                 await send(chatId, 
                     "╔══════════════════════════╗\n"+
@@ -1112,7 +1109,6 @@ async function checkResult(userId, chatId, target, predicted, predType, betPlace
         setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 8000);
     }, 10000);
 }
-
 
 // ============================================================
 //  STATS
