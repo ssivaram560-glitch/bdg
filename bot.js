@@ -283,7 +283,7 @@ async function autoLogin(userId, chatId, silent = false) {
         return false;
     }
 
-    let browser;
+      let browser;
     try {
         browser = await puppeteer.launch({
             headless: true, 
