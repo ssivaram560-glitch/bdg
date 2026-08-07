@@ -3,11 +3,12 @@ const axios       = require('axios');
 const crypto      = require('crypto');
 const zlib        = require('zlib');
 const puppeteer   = require('puppeteer');
+const predictionEngine = require('./predictionEngine');
 
 // ============================================================
 //  CONFIG
 // ============================================================
-const BOT_TOKEN    ="8999335291:AAENHUVLZGTX-qame6CJCGnqLB_tYsehjrI";
+const BOT_TOKEN    ="8906099266:AAEwOi1BZqm_HGHTo6aizZD3mw4fwMFhzF8";
 const OWNER_ID     = 1865939951;
 const OWNER_PASS   = "praveensaran";
 const ADMIN_HANDLE = "@lucifer1570";
@@ -1076,6 +1077,27 @@ async function runPredict(userId, chatId) {
     const signal = decidePrediction(list);
     if(!signal) return setTimeout(()=>runPredict(userId,chatId), 5000);
 
+    // --- Lose-streak prediction override (per-user) ---
+    let loseStreakSkip = false;
+    try {
+        const numbers = buildNumberList(list, 10);
+        if (numbers && numbers.length === 10 && signal.type === 'SIZE') {
+            const numsOldestFirst = numbers.slice().reverse();
+            const logicLevel = (st.consecutiveLoss % 10) + 1;
+            const lsRes = predictionEngine.predictByLogic(logicLevel, numsOldestFirst);
+            // attach info for debugging
+            signal.loseStreak = { logicLevel, prediction: lsRes.prediction, reason: lsRes.reason };
+            if (lsRes.prediction === 'SKIP') {
+                loseStreakSkip = true;
+            } else {
+                // Override size signal with lose-streak prediction
+                signal.val = lsRes.prediction;
+            }
+        }
+    } catch (e) {
+        console.error('[LoseStreak] Error:', e.message);
+    }
+
     let abLine = "🤖 AutoBet: OFF";
     let canBet = false;
     let skippedCycle = false;
@@ -1096,6 +1118,15 @@ async function runPredict(userId, chatId) {
         canBet = true;
         const curBet = cfg.customBets[st.level-1] || (cfg.baseBet*MULT[st.level-1]);
         abLine = (st.level > 1 ? "📈 MART " : "💰 BET ") + "L" + st.level + ": ₹" + curBet;
+    }
+
+    // If lose-streak logic requested a SKIP, prevent betting this cycle
+    if (loseStreakSkip) {
+        canBet = false;
+        skippedCycle = true;
+        const ll = signal.loseStreak && signal.loseStreak.logicLevel ? signal.loseStreak.logicLevel : '?';
+        const rr = signal.loseStreak && signal.loseStreak.reason ? signal.loseStreak.reason : 'LS SKIP';
+        abLine = `⏭️ LOSE-STREAK SKIP (L${ll}: ${rr})`;
     }
 
     await send(chatId,
