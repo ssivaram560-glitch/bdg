@@ -1,5 +1,8 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios       = require('axios');
+const httpAgent  = new (require('http').Agent)({ keepAlive: true, maxSockets: 32, maxFreeSockets: 8, timeout: 10000 });
+const httpsAgent = new (require('https').Agent)({ keepAlive: true, maxSockets: 32, maxFreeSockets: 8, timeout: 10000 });
+const apiClient  = axios.create({ httpAgent, httpsAgent, timeout: 10000, maxContentLength: 1024 * 1024, maxBodyLength: 1024 * 1024 });
 const crypto      = require('crypto');
 const zlib        = require('zlib');
 const puppeteer   = require('puppeteer');
@@ -7,10 +10,10 @@ const puppeteer   = require('puppeteer');
 // ============================================================
 //  CONFIG
 // ============================================================
-const BOT_TOKEN    ="8999335291:AAH-e-xo1Bn7bWqH_OxJUOLYhO43au5PWXs";
-const OWNER_ID     = 1865939951;
-const OWNER_PASS   = "praveensaran";
-const ADMIN_HANDLE = "@lucifer1570";
+const BOT_TOKEN    = process.env.BOT_TOKEN || "8957443232:AAEUBtzwrE-yb2KZQb_GmJ-bd9p2mtVZvVA";
+const OWNER_ID     = 8869874751;
+const OWNER_PASS   = process.env.OWNER_PASS || "2004";
+const ADMIN_HANDLE = "@Sivakutty1";
 const REG_LINK     = "https://bdgwinuu.com/#/register?invitationCode=7442815992780";
 const WIN_STICKER  = "CAACAgUAAxkBAAFHUGNp4JX1-ohP4uBEWpfNptaz-HmwVgAC4hgAAhboKVbObuGuTcMs2zsE";
 const LOSS_STICKER = "CAACAgUAAxkBAAFHUGVp4JX-BE2TRkhIKTwcjkwW-gzdPAACthoAAoG8YVYiydObSa0O8zsE";
@@ -36,9 +39,9 @@ http.createServer((req, res) => {
 const RENDER_URL = process.env.RENDER_URL || "";
 if (RENDER_URL) {
     setInterval(() => {
-        axios.get(RENDER_URL).catch(() => {});
+        apiClient.get(RENDER_URL).catch(() => {});
         console.log("[PING] Keep-alive ping sent");
-    }, 14 * 60 * 1000);
+    }, 14 * 60 * 1000).unref();
 }
 
 // ============================================================
@@ -61,7 +64,15 @@ let autobetState   = {};
 let profitTrack    = {};
 let GLOBAL_TOKEN   = "";
 let userTokens = {}; 
-
+let userStates = {};
+let loopTimers = {};
+let resultIntervals = {};
+const predictionPromises = new Map();
+const aiModePromises = new Map();
+const aiModeCache = new Map();
+const MAX_AI_CACHE = 200;
+const MAX_SENT_PERIODS = 1000;
+const MAX_RESULT_HISTORY = 500;
 
 
 // ============================================================
@@ -87,22 +98,26 @@ async function logBoth(chatId, msg, isError = false) {
 // ============================================================
 async function fetchList() {
     try {
-        const response = await axios.get(DRAW_URL, {
-            headers: {
-                "Accept": "application/json, text/plain, */*",
-                "Origin": "https://bdgwin901.com",
-                "Referer": "https://bdgwin901.com/",
-                "Ar-Origin": "https://bdgwin901.com",
-                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
-            },
+        const response = await apiClient.get(process.env.LUCIFER_API_URL || "https://luciferapi.com/", {
+            headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0" },
             timeout: 10000
         });
-        if (response.data && response.data.data && response.data.data.list) {
-            return response.data.data.list;
+        const rows = response.data?.data;
+        if (!Array.isArray(rows)) {
+            console.error("[LUCIFER API] Invalid response: data is not an array");
+            return null;
         }
-        return [];
+        return rows.map(row => ({
+            issueNumber: String(row.issueNumber ?? row.period ?? row.issue ?? ""),
+            number: Number(row.number ?? row.winNumber),
+            size: String(row.size || "").toUpperCase(),
+            color: String(row.color || "").toUpperCase(),
+            openTime: row.openTime,
+            timestamp: row.timestamp
+        })).filter(row => /^\d+$/.test(row.issueNumber) && Number.isInteger(row.number) && row.number >= 0 && row.number <= 9)
+          .sort((a, b) => BigInt(b.issueNumber) > BigInt(a.issueNumber) ? 1 : BigInt(b.issueNumber) < BigInt(a.issueNumber) ? -1 : 0);
     } catch (error) {
-        console.error("[FETCH LIST ERROR]", error.message);
+        console.error("[LUCIFER API ERROR]", error.message);
         return null;
     }
 }
@@ -136,12 +151,12 @@ async function getLiveBalance(userId, chatId = null) {
     };
 
     try {
-        const r = await axios.get(url, { headers, timeout: 5000 });
+        const r = await apiClient.get(url, { headers, timeout: 5000 });
         return await parseBalanceResponse(r);
     } catch (e) {
         if (e.response && e.response.status === 405) {
             try {
-                const r2 = await axios.post(url, {}, { headers, timeout: 5000 });
+                const r2 = await apiClient.post(url, {}, { headers, timeout: 5000 });
                 return await parseBalanceResponse(r2);
             } catch (e2) {
                 const errMsg = e2.response?.data?.msg || e2.message || "API Error";
@@ -195,6 +210,36 @@ function isAdmin(id)    { return adminPasswords[id] !== undefined; }
 function isAdminIn(id)  { return adminLoggedIn[id] === true; }
 function sleep(ms)      { return new Promise(r => setTimeout(r, ms)); }
 function getToken(id)   { return userTokens[id] || GLOBAL_TOKEN || ""; }
+
+function scheduleRun(userId, chatId, delayMs) {
+    if (!running[userId]) return;
+    if (loopTimers[userId]) clearTimeout(loopTimers[userId]);
+    const timer = setTimeout(() => {
+        if (loopTimers[userId] !== timer) return;
+        loopTimers[userId] = null;
+        if (running[userId] && !predictionPromises.has(userId)) runPredict(userId, chatId);
+    }, Math.max(250, delayMs));
+    timer.unref?.();
+    loopTimers[userId] = timer;
+}
+
+function clearUserTimers(userId) {
+    if (loopTimers[userId]) clearTimeout(loopTimers[userId]);
+    loopTimers[userId] = null;
+    if (resultIntervals[userId]) clearTimeout(resultIntervals[userId]);
+    resultIntervals[userId] = null;
+}
+
+function rememberPeriod(userId, period) {
+    const set = sentPeriods[userId] || (sentPeriods[userId] = new Set());
+    if (set.has(period)) return false;
+    set.add(period);
+    while (set.size > MAX_SENT_PERIODS) {
+        const oldest = set.values().next().value;
+        set.delete(oldest);
+    }
+    return true;
+}
 
 function generateKey(days, by) {
     const k = "EARN WITH ME-"+crypto.randomBytes(3).toString('hex').toUpperCase()+"-"+crypto.randomBytes(2).toString('hex').toUpperCase();
@@ -284,7 +329,7 @@ function makeBetSign(params) {
 // ============================================================
 async function fetchCaptcha() {
     try {
-        const r = await axios.get(CAPTCHA_URL, {
+        const r = await apiClient.get(CAPTCHA_URL, {
             headers: {
                 "Accept": "application/json, text/plain, */*",
                 "Origin": "https://bdgwin8.vip",
@@ -440,7 +485,7 @@ async function placeBet(userId, chatId, period, prediction, predType, level) {
     const betMult   = cfg.customBets[level-1] || (cfg.baseBet * MULT[level-1]);
     let bc = "";
 
-    const maxRetries = 5; 
+    const maxRetries = 3; 
     const retryDelayMs = 2000; 
 
     if (predType === "SIZE")  bc = prediction === "BIG" ? "BigSmall_Big" : "BigSmall_Small";
@@ -464,7 +509,7 @@ async function placeBet(userId, chatId, period, prediction, predType, level) {
             const timestamp = Math.floor(Date.now() / 1000);
             const payload   = {...params, signature, timestamp};
 
-            const r = await axios.post(BET_URL, payload, {
+            const r = await apiClient.post(BET_URL, payload, {
                 headers: {
                     "authorization":    "Bearer " + token,
                     "content-type":     "application/json",
@@ -566,268 +611,263 @@ async function placeBet(userId, chatId, period, prediction, predType, level) {
     console.log("[BET FAIL] All retries exhausted.");
     return false;
 }
+
 // ============================================================
 // ============================================================
-// COMPLETE BOT LOGIC WITH 4-PREDICTION PATTERN MODE EXTENSION & FIXES
 // ============================================================
+//  STATE AND HISTORY HELPERS
 // ============================================================
-// COMPLETE BOT LOGIC WITH STRICT 4-CONSECUTIVE LOSS REQUIREMENT (NO WINS ALLOWED)
-// ============================================================
-let userStates = {};
+function initState(userId) {
+    initUser(userId);
+    if (!userStates[userId]) {
+        userStates[userId] = { resultHistory: [], skipCount: 0, currentMode: null, lastPrediction: null };
+    }
+    const state = userStates[userId];
+    if (!Array.isArray(state.resultHistory)) state.resultHistory = [];
+    if (!Array.isArray(state.modeHistory)) state.modeHistory = [];
+    if (!state.currentMode) state.currentMode = "NORMAL";
+    if (!state.lastPredictionMode) state.lastPredictionMode = state.currentMode;
+    if (typeof state.skipCount !== "number") state.skipCount = 0;
+    if (state.currentMode === undefined) state.currentMode = null;
+    if (state.lastPrediction === undefined) state.lastPrediction = null;
+}
 
 function buildBSFromList(list, count = 15) {
-    if (!list || !Array.isArray(list)) return [];
-    const sliced = list.slice(0, count);
-    const resultHistory = [];
-
-    for (let i = sliced.length - 1; i >= 0; i--) {
-        const item = sliced[i];
-        const num = parseInt(item.number || item.winNumber || 0);
-        const size = num >= 5 ? "BIG" : "SMALL";
-        resultHistory.push(size);
-    }
-    return resultHistory;
+    if (!Array.isArray(list)) return [];
+    return list.slice(0, count).map(row => sizeOf(row) || (Number(row.number) >= 5 ? "B" : "S")).reverse();
 }
 
-function initState(userId) {
-    if (!userStates[userId]) {
-        userStates[userId] = {
-            mode: "NORMAL", 
-            pendingPrediction: true,
-            forcedModeQueue: [],    
-            historyModes: [],
-            periodCounter: 0,        
-            normalWinsIn20: 0,       
-            recoveryWinsIn20: 0,
-            lastPredictionWasLoss: false,
-            consecutivePatternLoss: 0 // 🔥 தொடர்ந்து வரும் லாஸை கணக்கிட
-        };
-    } else {
-        if (!userStates[userId].historyModes) userStates[userId].historyModes = [];
-        if (!userStates[userId].forcedModeQueue) userStates[userId].forcedModeQueue = [];
-        if (userStates[userId].periodCounter === undefined) userStates[userId].periodCounter = 0;
-        if (userStates[userId].normalWinsIn20 === undefined) userStates[userId].normalWinsIn20 = 0;
-        if (userStates[userId].recoveryWinsIn20 === undefined) userStates[userId].recoveryWinsIn20 = 0;
-        if (userStates[userId].lastPredictionWasLoss === undefined) userStates[userId].lastPredictionWasLoss = false;
-        if (userStates[userId].consecutivePatternLoss === undefined) userStates[userId].consecutivePatternLoss = 0;
-        if (userStates[userId].betLossStreak === undefined) userStates[userId].betLossStreak = 0;
-        if (userStates[userId].betLossCount === undefined) userStates[userId].betLossCount = 0;
-        if (userStates[userId].skipPredictionCount === undefined) userStates[userId].skipPredictionCount = 0;
-    }
-}
-
-function decidePrediction(list, currentLevel, userId) {
-    if (!list || list.length < 2) {
-        return null;
-    }
-
+function updateAfterResult(userId, wasWin, actualSize, betPlaced) {
     initState(userId);
     const state = userStates[userId];
+    const st = autobetState[userId];
+    const cfg = autobetCfg[userId];
+    const bs = actualSize === "BIG" || actualSize === "B" ? "B" : "S";
+    const usedMode = state.lastPredictionMode || state.currentMode || "NORMAL";
+    state.modeHistory.push({ mode: usedMode, outcome: wasWin ? "W" : "L", actual: bs });
+    if (state.modeHistory.length > MAX_RESULT_HISTORY) state.modeHistory.splice(0, state.modeHistory.length - MAX_RESULT_HISTORY);
+    state.currentMode = wasWin ? usedMode : (usedMode === "NORMAL" ? "RECOVERY" : "NORMAL");
+    state.resultHistory.push(bs);
+    if (state.resultHistory.length > MAX_RESULT_HISTORY) state.resultHistory.splice(0, state.resultHistory.length - MAX_RESULT_HISTORY);
 
-    const recentResults = list.slice(0, 4).reverse().map(item => parseItem(item).size);
-    const [olderResult, latestResult] = recentResults.slice(0, 2);
-    const last4Results = recentResults.slice(0, 4);
-    const isBBSS = last4Results.length >= 4 && last4Results[0] === "BIG" && last4Results[1] === "BIG" && last4Results[2] === "SMALL" && last4Results[3] === "SMALL";
-    const isSSBB = last4Results.length >= 4 && last4Results[0] === "SMALL" && last4Results[1] === "SMALL" && last4Results[2] === "BIG" && last4Results[3] === "BIG";
-
-    if (state.skipPredictionCount > 0) {
-        state.skipPredictionCount--;
-        return null;
-    }
-
-    if (isBBSS || isSSBB) {
-        state.skipPredictionCount = 1;
-        return null;
-    }
-
-    let prediction;
-
-    if (state.betLossStreak >= 2 && recentResults.length >= 3) {
-        const [oldest, middle, newest] = recentResults;
-        if (oldest === "BIG" && middle === "BIG" && newest === "SMALL") {
-            prediction = "SMALL";
-        } else if (oldest === "SMALL" && middle === "SMALL" && newest === "BIG") {
-            prediction = "BIG";
-        } else if (olderResult === latestResult) {
-            prediction = latestResult;
-        } else {
-            prediction = latestResult === "BIG" ? "SMALL" : "BIG";
-        }
-    } else if (olderResult === latestResult) {
-        prediction = latestResult;
-    } else {
-        prediction = latestResult === "BIG" ? "SMALL" : "BIG";
-    }
-
-    return {
-        type: "SIZE",
-        val: prediction,
-        conf: 85,
-        pat: `RULE${state.betLossStreak >= 2 ? " (L2)" : ""}`
-    };
-}
-
-function updateAfterResult(userId, wasWin, actual, betPlaced) {
-    initState(userId);
-    const state = userStates[userId];
-    
-    state.lastPredictionWasLoss = !wasWin;
-    state.periodCounter++;
-
-    const currentActiveMode = (state.historyModes.length > 0) ? state.historyModes[state.historyModes.length - 1] : (state.mode === "NORMAL" ? "N" : "R");
-    
-    if (wasWin) {
-        state.consecutivePatternLoss = 0;
-        state.betLossStreak = 0;
-        if (currentActiveMode === "N") {
-            state.normalWinsIn20++;
-        } else {
-            state.recoveryWinsIn20++;
-        }
-    } else {
-        state.consecutivePatternLoss++;
-
-        if (betPlaced) {
-            state.betLossStreak = (state.betLossStreak || 0) + 1;
-            state.betLossCount = (state.betLossCount || 0) + 1;
-
-            if (state.betLossCount === 3) {
-                state.skipPredictionCount = 5;
-            } else if (state.betLossCount === 5) {
-                state.skipPredictionCount = 4;
-            } else if (state.betLossCount === 7) {
-                state.skipPredictionCount = 6;
-            }
-        }
-
-        if (state.mode === "NORMAL") {
-            state.mode = "RECOVERY";
-            state.historyModes.push("R");
-        } else {
-            state.mode = "NORMAL";
-            state.historyModes.push("N");
-        }
-        if (state.historyModes.length > 20) {
-            state.historyModes.shift();
-        }
-    }
-
-    if (state.forcedModeQueue && state.forcedModeQueue.length > 0) {
-        if (wasWin) {
-            state.forcedModeQueue = [];
-        } else {
-            state.forcedModeQueue.shift(); 
-        }
-    } 
-
-    if (typeof autobetState !== 'undefined' && autobetState[userId]) {
-        const st = autobetState[userId];
-        const cfg = autobetCfg[userId];
-
-        if (betPlaced) {
+    if (!betPlaced) {
+        if (cfg.watch) {
             if (wasWin) {
-                st.level = 1;
                 st.consecutiveLoss = 0;
+                st.level = 1;
+                st.inMart = false;
             } else {
                 st.consecutiveLoss++;
-                st.level++;
-                if (st.level > cfg.maxLvl) {
+                if (st.consecutiveLoss >= Math.max(1, Number(cfg.watchLoss) || 1)) {
+                    st.inMart = true;
                     st.level = 1;
-                    st.consecutiveLoss = 0;
-                }
-            }
-        } else {
-            if (cfg && cfg.watch) {
-                if (wasWin) {
-                    st.consecutiveLoss = 0; 
-                } else {
-                    st.consecutiveLoss++; 
                 }
             }
         }
+        return;
+    }
+
+    if (wasWin) {
+        st.consecutiveLoss = 0;
+        st.level = 1;
+        st.inMart = false;
+        state.skipCount = 0;
+    } else {
+        st.consecutiveLoss++;
+        st.inMart = true;
+        st.level++;
+        if (st.level > Math.max(1, Number(cfg.maxLvl) || 1)) {
+            st.level = 1;
+            st.consecutiveLoss = 0;
+            st.inMart = false;
+        }
+        if ([3, 5, 7].includes(st.consecutiveLoss)) state.skipCount = Math.max(state.skipCount, 5);
     }
 }
 
 function getStatus(userId) {
     initState(userId);
     const state = userStates[userId];
-    return state.mode;
-}
-
-// ============================================================
-// 2. handleWin - UI & Stats
-// ============================================================
-async function handleWin(userId, chatId, actual, num, betLevel) {
-    const pt = profitTrack[userId];
-    const cfg = autobetCfg[userId];
-    const amt = cfg.customBets[betLevel-1] || (cfg.baseBet * MULT[betLevel-1]);
-    const profit = amt * 0.98;
-    
-    pt.totalBets++; pt.wins++; pt.pnl += profit; 
-    pt.totalBetAmount = (pt.totalBetAmount || 0) + amt;
-    pt.winStreak++; pt.lossStreak = 0;
-    if(pt.winStreak > pt.maxW) pt.maxW = pt.winStreak;
-
-    await send(chatId,
-"╔══════════════════════════╗\n"+
-"║  ✅ WIN! 🎉              ║\n"+
-"╠══════════════════════════╣\n"+
-"║ Number : "+num+"\n"+
-"║ Result : "+actual+"\n"+
-"║ Profit : +₹"+profit.toFixed(2)+"\n"+
-"║ P&L    : "+(pt.pnl>=0?"+":"")+pt.pnl.toFixed(2)+"\n"+
-"║ Streak : "+pt.winStreak+" wins\n"+
-"║ Total  : "+pt.wins+"W/"+pt.losses+"L\n"+
-"║ Reset  : L1 | Watch 0/"+cfg.watchLoss+"\n"+
-"╚══════════════════════════╝"
-    );
-    await sendSticker(chatId, WIN_STICKER);
-}
-
-// ============================================================
-// 3. handleLoss - UI & Stats
-// ============================================================
-async function handleLoss(userId, chatId, actual, num, betLevel) {
     const st = autobetState[userId];
-    const pt = profitTrack[userId];
-    const cfg = autobetCfg[userId];
-    const amt = cfg.customBets[betLevel-1] || (cfg.baseBet * MULT[betLevel-1]);
-    
-    pt.totalBets++; pt.losses++; pt.pnl -= amt; 
-    pt.totalBetAmount = (pt.totalBetAmount || 0) + amt;
-    pt.lossStreak++; pt.winStreak = 0;
-    if(pt.lossStreak > pt.maxL) pt.maxL = pt.lossStreak;
-
-    if(betLevel < cfg.maxLvl){
-        const next = cfg.customBets[st.level-1] || (cfg.baseBet * MULT[st.level-1]);
-        await send(chatId,
-"╔══════════════════════════╗\n"+
-"║  ❌ LOSS                 ║\n"+
-"╠══════════════════════════╣\n"+
-"║ Number : "+num+"\n"+
-"║ Result : "+actual+"\n"+
-"║ Loss   : -₹"+amt+"\n"+
-"║ P&L    : "+(pt.pnl>=0?"+":"")+pt.pnl.toFixed(2)+"\n"+
-"╠══════════════════════════╣\n"+
-"║ Next L"+st.level+" : ₹"+next+"\n"+
-"╚══════════════════════════╝"
-        );
-    } else {
-        await send(chatId,
-"╔══════════════════════════╗\n"+
-"║  💀 MAX LEVEL LOSS       ║\n"+
-"╠══════════════════════════╣\n"+
-"║ Loss   : -₹"+amt+"\n"+
-"║ P&L    : "+(pt.pnl>=0?"+":"")+pt.pnl.toFixed(2)+"\n"+
-"║ Reset  : L1 | Watch 0/"+cfg.watchLoss+"\n"+
-"╚══════════════════════════╝"
-        );
-    }
-    await sendSticker(chatId, LOSS_STICKER);
+    return `${state.currentMode || "SAME"} MODE | L${st?.level || 1} | History: ${state.resultHistory.join("")}`;
 }
 
+//  CALCULATION + WINNING-MODE W/L PATTERN ENGINE
 // ============================================================
-// PREDICT LOOP
+function normalizeSize(value) {
+    const v = String(value || "").toUpperCase();
+    return v === "BIG" || v === "B" ? "B" : v === "SMALL" || v === "S" ? "S" : null;
+}
+
+function sizeOf(row) {
+    const fromApi = normalizeSize(row.size);
+    return fromApi || (Number(row.number) >= 5 ? "B" : "S");
+}
+
+function nextIssueNumber(list) {
+    if (!list?.length) return null;
+    return (BigInt(list[0].issueNumber) + 1n).toString();
+}
+
+function calculateNormalSize(period, currentNumber) {
+    const n = Number(currentNumber);
+    if (!Number.isInteger(n) || n < 0 || n > 9) return null;
+    const nextLast3 = Number(String(BigInt(period) + 1n).slice(-3));
+    const answer = nextLast3 * Math.exp(n);
+    const noDecimal = answer.toString().replace(".", "");
+    const first14 = noDecimal.substring(0, 14);
+    if (!first14) return null;
+    const lastDigit = Number(first14.charAt(first14.length - 1));
+    return lastDigit <= 4 ? "S" : "B";
+}
+
+function oppositeSize(value) {
+    return value === "B" ? "S" : "B";
+}
+
+function buildWinningModeHistory(list) {
+    const rows = [...list].slice(0, MAX_RESULT_HISTORY).sort((a, b) => {
+        const aa = BigInt(a.issueNumber), bb = BigInt(b.issueNumber);
+        return aa < bb ? -1 : aa > bb ? 1 : 0;
+    });
+    const records = [];
+    let mode = "NORMAL";
+    for (let i = 0; i + 1 < rows.length; i++) {
+        const current = rows[i], next = rows[i + 1];
+        const number = Number(current.number ?? current.winNumber ?? 0);
+        const actual = sizeOf(next), normalPrediction = calculateNormalSize(current.issueNumber, number);
+        if (!normalPrediction || !actual) continue;
+        const prediction = predictionForMode(mode, normalPrediction);
+        const outcome = prediction === actual ? "W" : "L";
+        records.push({ sourcePeriod: String(current.issueNumber), targetPeriod: String(next.issueNumber), modeUsed: mode, normalPrediction, prediction, actual, outcome });
+        if (outcome === "L") mode = mode === "NORMAL" ? "RECOVERY" : "NORMAL";
+    }
+    return { rows, records, wlSequence: records.map(r => r.outcome) };
+}
+
+function predictionForMode(mode, normalPrediction) {
+    return mode === "NORMAL" ? oppositeSize(normalPrediction) : normalPrediction;
+}
+
+function evaluateMode(records, mode, windowSize = 60) {
+    const sample = records.slice(-windowSize);
+    let wins = 0;
+    let weightedWins = 0;
+    let weightedTotal = 0;
+    let recentWins = 0;
+    const n = sample.length;
+    for (let i = 0; i < n; i++) {
+        const row = sample[i];
+        const prediction = predictionForMode(mode, row.normalPrediction);
+        const win = prediction === row.actual;
+        if (win) wins++;
+        if (i >= Math.max(0, n - 10) && win) recentWins++;
+        const weight = i + 1;
+        weightedTotal += weight;
+        if (win) weightedWins += weight;
+    }
+    return {
+        mode,
+        samples: n,
+        wins,
+        losses: n - wins,
+        accuracy: n ? wins / n : 0,
+        weightedAccuracy: weightedTotal ? weightedWins / weightedTotal : 0,
+        recentAccuracy: Math.min(n, 10) ? recentWins / Math.min(n, 10) : 0
+    };
+}
+
+function analyzeModePattern(records, mode, maxLength = 12) {
+    const outcomes = records.filter(r => r.modeUsed === mode).map(r => r.outcome);
+    const limit = Math.min(maxLength, outcomes.length - 1);
+    for (let length = limit; length >= 2; length--) {
+        const pattern = outcomes.slice(-length).join("");
+        const next = [];
+        for (let i = 0; i + length < outcomes.length; i++) if (outcomes.slice(i, i + length).join("") === pattern) next.push(outcomes[i + length]);
+        if (next.length) { const wins = next.filter(x => x === "W").length; return { mode, pattern, patternLength: length, matches: next.length, wins, losses: next.length - wins, accuracy: wins / next.length }; }
+    }
+    const recent = outcomes.slice(-20), wins = recent.filter(x => x === "W").length;
+    return { mode, pattern: recent.join(""), patternLength: 0, matches: recent.length, wins, losses: recent.length - wins, accuracy: recent.length ? wins / recent.length : 0 };
+}
+
+function chooseWinningModeFromPattern(records, fallbackMode) {
+    const fallback = fallbackMode === "RECOVERY" ? "RECOVERY" : "NORMAL";
+    if (!Array.isArray(records) || records.length < 8) return { mode: fallback, pattern: "", patternLength: 0, patternMatches: 0, winningModeCounts: {}, continuationModeCounts: {}, modeScores: {}, selection: "fallback until 8 state-machine samples" };
+    const normal = analyzeModePattern(records, "NORMAL"), recovery = analyzeModePattern(records, "RECOVERY");
+    let mode = fallback;
+    if (normal.matches && recovery.matches && normal.accuracy !== recovery.accuracy) mode = normal.accuracy > recovery.accuracy ? "NORMAL" : "RECOVERY";
+    else if (normal.matches !== recovery.matches) mode = normal.matches > recovery.matches ? "NORMAL" : "RECOVERY";
+    const selected = mode === "NORMAL" ? normal : recovery;
+    return { mode, pattern: selected.pattern, patternLength: selected.patternLength, patternMatches: selected.matches, winningModeCounts: { NORMAL: normal.wins, RECOVERY: recovery.wins }, continuationModeCounts: { NORMAL: normal.matches, RECOVERY: recovery.matches }, modeScores: { NORMAL: normal, RECOVERY: recovery }, selection: `latest state-machine pattern selected ${mode}` };
+}
+
+async function askPatternAI(records, fallbackMode, userId, currentPeriod) {
+    const fallback = fallbackMode === "RECOVERY" ? "RECOVERY" : "NORMAL";
+    if (process.env.AI_MODE_ENABLED === "false" || !process.env.OPENAI_API_KEY || !process.env.OPENAI_API_BASE) return { mode: fallback, source: "local-pattern" };
+    const key = `${userId}:${currentPeriod}`;
+    if (aiModeCache.has(key)) return aiModeCache.get(key);
+    if (aiModePromises.has(userId)) return aiModePromises.get(userId);
+    const task = apiClient.post(`${process.env.OPENAI_API_BASE.replace(/\/$/, "")}/chat/completions`, { model: process.env.AI_MODEL || "gpt-5-mini", messages: [{ role: "system", content: "Analyze only the supplied state-machine patterns. Choose NORMAL or RECOVERY. Do not claim certainty or guaranteed wins. Return JSON only." }, { role: "user", content: JSON.stringify({ rule: "start NORMAL; loss toggles mode; win keeps same mode", records: records.slice(-60) }) }], response_format: { type: "json_schema", json_schema: { name: "mode_choice", strict: true, schema: { type: "object", properties: { mode: { type: "string", enum: ["NORMAL", "RECOVERY"] }, reason: { type: "string" } }, required: ["mode", "reason"], additionalProperties: false } } }, max_completion_tokens: 120 }, { timeout: 2500 }).then(r => { let d={}; try { d=JSON.parse(r.data?.choices?.[0]?.message?.content || "{}"); } catch {} const out={ mode: d.mode === "RECOVERY" || d.mode === "NORMAL" ? d.mode : fallback, source: "pattern-ai", reason: String(d.reason || "") }; aiModeCache.set(key,out); while(aiModeCache.size>MAX_AI_CACHE) aiModeCache.delete(aiModeCache.keys().next().value); return out; }).catch(() => ({ mode: fallback, source: "local-pattern" })).finally(() => aiModePromises.delete(userId));
+    aiModePromises.set(userId, task); return task;
+}
+
+async function decidePrediction(list, currentLevel, userId) {
+    if (!Array.isArray(list) || list.length < 2) return null;
+    initState(userId);
+    const state = userStates[userId];
+    const latest = list[0];
+    const currentPeriod = String(latest.issueNumber);
+    const currentNumber = Number(latest.number ?? latest.winNumber ?? 0);
+    if (!currentPeriod || !Number.isInteger(currentNumber)) return null;
+
+    const targetPeriod = (BigInt(currentPeriod) + 1n).toString();
+    const normalPrediction = calculateNormalSize(currentPeriod, currentNumber);
+    if (!normalPrediction) return null;
+
+    const history = buildWinningModeHistory(list);
+    const fallbackMode = state.currentMode === "RECOVERY" ? "RECOVERY" : "NORMAL";
+    const backtestInfo = chooseWinningModeFromPattern(history.records, fallbackMode);
+    const aiInfo = await askPatternAI(history.records, backtestInfo.mode, userId, currentPeriod);
+    const modeInfo = { ...backtestInfo, mode: aiInfo.mode, selection: `${aiInfo.source}: ${aiInfo.reason || backtestInfo.selection}` };
+    const mode = modeInfo.mode;
+    const finalPrediction = predictionForMode(mode, normalPrediction);
+
+    state.currentMode = mode;
+    state.lastPredictionMode = mode;
+    state.lastPrediction = finalPrediction;
+    return {
+        type: "SIZE",
+        val: finalPrediction === "B" ? "BIG" : "SMALL",
+        conf: modeInfo.patternLength > 0 ? 90 : 70,
+        pat: mode,
+        mode,
+        currentLevel: Number(currentLevel) || 1,
+        targetPeriod,
+        latestCompletedPeriod: currentPeriod,
+        referencePeriod: currentPeriod,
+        referenceValue: currentNumber,
+        currentResult: currentNumber,
+        normalPrediction: normalPrediction === "B" ? "BIG" : "SMALL",
+        pattern: modeInfo.pattern,
+        patternLength: modeInfo.patternLength,
+        patternMatches: modeInfo.patternMatches,
+        wlHistory: history.wlSequence.join(""),
+        analyzedRows: history.rows.length,
+        analyzedCalculations: history.records.length,
+        winningModeCounts: modeInfo.winningModeCounts,
+        continuationModeCounts: modeInfo.continuationModeCounts || {},
+        selectionRule: modeInfo.selection,
+        patternModeScores: modeInfo.modeScores,
+        predictionDetails: {
+            modeRule: mode === "NORMAL" ? "use recovery opposite because NORMAL mode was selected" : "use normal calculation because RECOVERY mode was selected",
+            formula: "next period last 3 digits × exp(current result), then last digit <= 4 => SMALL else BIG",
+            currentWLPattern: modeInfo.pattern,
+            winningModeCounts: modeInfo.winningModeCounts
+        },
+        calculationHistory: history.records
+    };
+}
+//  PREDICT LOOP
 // ============================================================
 function parseItem(item) {
     const n = +(item.number || item.winNumber || 0);
@@ -840,62 +880,79 @@ function parseItem(item) {
             n % 2 === 0 ? "RED" : "GREEN"
     };
 }
-
+function stk(arr, key) {
+    let count = 1;
+    let val = arr[0]?.[key];
+    for (let i = 1; i < arr.length; i++) {
+        if (arr[i][key] === val) count++;
+        else break;
+    }
+    return { val, count };
+}
 async function runPredict(userId, chatId) {
+    if (!running[userId] || predictionPromises.has(userId)) return;
+    const task = runPredictOnce(userId, chatId);
+    predictionPromises.set(userId, task);
+    try { return await task; } finally { if (predictionPromises.get(userId) === task) predictionPromises.delete(userId); }
+}
+
+async function runPredictOnce(userId, chatId) {
     if(!running[userId]) return;
     initUser(userId);
     const state = userStates[userId];
     const st = autobetState[userId];
     const cfg = autobetCfg[userId];
 
+    // Profit Target Check
     if (st.isWaiting) {
         if (Date.now() >= st.nextStartTime) {
             st.isWaiting = false;
             profitTrack[userId].pnl = 0; 
             await send(chatId, "🔄 Timed Restart! Starting new section...");
         } else {
-            return setTimeout(()=>runPredict(userId,chatId), 30000);
+            scheduleRun(userId, chatId, 30000); return;
         }
     }
 
     const list = await fetchList();
-    if(!list) return setTimeout(()=>runPredict(userId,chatId), 15000);
+    if(!list) { scheduleRun(userId, chatId, 15000); return; }
 
-    const next = (BigInt(list[0].issueNumber)+1n).toString();
-    if(sentPeriods[userId].has(next)) return setTimeout(()=>runPredict(userId,chatId), 2000);
-    sentPeriods[userId].add(next);
-
-    const signal = decidePrediction(list, st.level, userId);
-    if(!signal) return setTimeout(()=>runPredict(userId,chatId), 5000);
+    const next = nextIssueNumber(list);
+    if (!next || BigInt(next) <= BigInt(list[0].issueNumber)) { scheduleRun(userId, chatId, 5000); return; }
+    const signal = await decidePrediction(list, st.level, userId);
+    if(!signal) { scheduleRun(userId, chatId, 5000); return; }
+    if(!rememberPeriod(userId, next)) { scheduleRun(userId, chatId, 2000); return; }
 
     let abLine = "🤖 AutoBet: OFF";
     let canBet = false;
 
-    if (!cfg || !cfg.enabled) {
+    if (!cfg.enabled) {
         abLine = "🤖 AutoBet: OFF";
+        canBet = false;
+    } else if (state.skipCount > 0) {
+        abLine = `⏭️ SKIP BET (${state.skipCount} left)`;
+        state.skipCount--;
         canBet = false;
     } else if (cfg.watch && st.consecutiveLoss < cfg.watchLoss) {
         abLine = `👀 WATCHING: ${st.consecutiveLoss}/${cfg.watchLoss}`;
         canBet = false;
     } else {
+        // Condition for betting met (either direct bet or watch condition satisfied)
         canBet = true;
         const curBet = cfg.customBets[st.level-1] || (cfg.baseBet*MULT[st.level-1]);
         abLine = (st.level > 1 ? "📈 MART " : "💰 BET ") + "L" + st.level + ": ₹" + curBet;
     }
 
-    const patternName = signal && signal.pat ? signal.pat : (state && state.mode ? state.mode : "NORMAL");
-    const waitLine = (cfg && cfg.watch && st.consecutiveLoss < cfg.watchLoss) ? "\nWatch Loss: " + st.consecutiveLoss + "/" + cfg.watchLoss : "";
-
     await send(chatId,
 "╔══════════════════════════╗\n"+
-"║    👑 EARN WITH ME AI    ║\n"+
+"║   👑 EARN WITH ME AI    ║\n"+
 "╠══════════════════════════╣\n"+
 "║ Period  : "+next.slice(-6)+"\n"+
 "║ Signal  : "+(signal.val==="BIG"?"🔵 BIG":"🟠 SMALL")+"\n"+
-"║ Pattern : "+patternName+"\n"+
+"║ Mode    : "+signal.mode+"\n"+
+        "║ Normal  : "+signal.normalPrediction+"\n"+
 "╠══════════════════════════╣\n"+
 "║ "+abLine+"\n"+
-waitLine+"\n"+
 "╚══════════════════════════╝",
         {reply_markup:{inline_keyboard:[[{text:"💰 CHECK NOW",url:REG_LINK}]]}}
     );
@@ -913,91 +970,64 @@ waitLine+"\n"+
 
     checkResult(userId, chatId, next, signal.val, signal.type, betPlaced);
 }
+// ============================================================
+//  RESULT CHECKER
+// ============================================================
 
-// ============================================================
-// RESULT CHECKER
-// ============================================================
+
+// 4. checkResult - Robust Update & Full UI
 async function checkResult(userId, chatId, target, predicted, predType, betPlaced) {
+    if (resultIntervals[userId]) clearTimeout(resultIntervals[userId]);
     let tries = 0;
-    const cfg = autobetCfg[userId];
-    const st = autobetState[userId];
-    const pt = profitTrack[userId];
-    
-    const iv = setInterval(async () => {
-        if (!running[userId]) return clearInterval(iv);
+    const poll = async () => {
+        if (!running[userId]) { resultIntervals[userId] = null; return; }
         if (++tries > 25) {
-            clearInterval(iv);
+            resultIntervals[userId] = null;
             await logBoth(chatId, "⏱ Timeout — checking next period...");
-            setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 3000);
+            scheduleRun(userId, chatId, 3000);
             return;
         }
-        const list = await fetchList(); if (!list) return;
-        if (BigInt(list[0].issueNumber) < BigInt(target)) return;
-        clearInterval(iv);
-
-        const res = list.find(i => i.issueNumber === target) || list[0];
-        const num = parseInt(res.number || res.winNumber || 0);
-        let actual;
-        if (predType === "SIZE") actual = num >= 5 ? "BIG" : "SMALL";
-        else actual = num === 0 ? "RED" : num === 5 ? "GREEN" : num % 2 === 0 ? "RED" : "GREEN";
-        
-        const win = predicted === actual;
-        const betLevel = st.level;
-
-        updateAfterResult(userId, win, actual, betPlaced);
-
-        const s = stats[userId];
-        s.total++;
-        if (win) {
-            s.win++; s.winStreak++; s.lossStreak = 0;
-            if (s.winStreak > s.maxWinStreak) s.maxWinStreak = s.winStreak;
-        } else {
-            s.loss++; s.lossStreak++; s.winStreak = 0;
-            if (s.lossStreak > s.maxLossStreak) s.maxLossStreak = s.lossStreak;
-        }
-
-        if (betPlaced) {
-            if (win) await handleWin(userId, chatId, actual, num, betLevel);
-            else await handleLoss(userId, chatId, actual, num, betLevel);
-
-            const targetProfit = Number(cfg.targetProfit) || 1000;
-            if (pt.pnl >= targetProfit) {
-                st.isWaiting = true;
-                st.nextStartTime = Date.now() + (Number(cfg.restartDelay) || 1) * 60 * 1000;
-                await send(chatId, "🎯 TARGET REACHED! Bot Paused.");
+        try {
+            const list = await fetchList();
+            if (!list || BigInt(list[0].issueNumber) < BigInt(target)) {
+                const t = setTimeout(poll, 10000); t.unref?.(); resultIntervals[userId] = t; return;
             }
-        } else {
-            if (win) {
-                await send(chatId, 
-                    "╔══════════════════════════╗\n"+
-                    "║  👀 WATCH RESULT: WIN! ✅ ║\n"+
-                    "╠══════════════════════════╣\n"+
-                    "║ Number : "+num+"\n"+
-                    "║ Result : "+actual+"\n"+
-                    "║ Status : Correct Prediction\n"+
-                    "╚══════════════════════════╝"
-                );
-                await sendSticker(chatId, WIN_STICKER);
+            const res = list.find(i => i.issueNumber === target);
+            if (!res) {
+                const t = setTimeout(poll, 10000); t.unref?.(); resultIntervals[userId] = t; return;
+            }
+            resultIntervals[userId] = null;
+            const num = Number(res.number ?? res.winNumber);
+            if (!Number.isInteger(num) || num < 0 || num > 9) { scheduleRun(userId, chatId, 3000); return; }
+            const actual = predType === "SIZE" ? (num >= 5 ? "BIG" : "SMALL") : (num === 0 ? "RED" : num === 5 ? "GREEN" : num % 2 === 0 ? "RED" : "GREEN");
+            const win = predicted === actual;
+            const st = autobetState[userId], cfg = autobetCfg[userId], pt = profitTrack[userId];
+            const betLevel = st.level;
+            updateAfterResult(userId, win, actual, betPlaced);
+            const statsRow = stats[userId];
+            statsRow.total++;
+            if (win) { statsRow.win++; statsRow.winStreak++; statsRow.lossStreak = 0; statsRow.maxWinStreak = Math.max(statsRow.maxWinStreak, statsRow.winStreak); }
+            else { statsRow.loss++; statsRow.lossStreak++; statsRow.winStreak = 0; statsRow.maxLossStreak = Math.max(statsRow.maxLossStreak, statsRow.lossStreak); }
+            if (betPlaced) {
+                if (win) await handleWin(userId, chatId, actual, num, betLevel); else await handleLoss(userId, chatId, actual, num, betLevel);
+                const targetProfit = Number(cfg.targetProfit) || 1000;
+                if (pt.pnl >= targetProfit) { st.isWaiting = true; st.nextStartTime = Date.now() + (Number(cfg.restartDelay) || 1) * 60000; await send(chatId, "🎯 TARGET REACHED! Bot Paused."); }
             } else {
-                await send(chatId, 
-                    "╔══════════════════════════╗\n"+
-                    "║  👀 WATCH RESULT: LOSS ❌ ║\n"+
-                    "╠══════════════════════════╣\n"+
-                    "║ Number : "+num+"\n"+
-                    "║ Result : "+actual+"\n"+
-                    "║ Status : Incorrect Prediction\n"+
-                    "╚══════════════════════════╝"
-                );
-                await sendSticker(chatId, LOSS_STICKER);
+                await send(chatId, `👀 WATCH RESULT: ${win ? "WIN! ✅" : "LOSS ❌"}\nNumber: ${num}\nResult: ${actual}`);
+                await sendSticker(chatId, win ? WIN_STICKER : LOSS_STICKER);
             }
+            scheduleRun(userId, chatId, 8000);
+        } catch (err) {
+            console.error('[RESULT CHECK]', err.message);
+            const t = setTimeout(poll, 10000); t.unref?.(); resultIntervals[userId] = t;
         }
-
-        setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 8000);
-    }, 10000);
+    };
+    await poll();
 }
 
-module.exports = { decidePrediction, updateAfterResult, getStatus, initState, buildBSFromList, runPredict, checkResult };
-
+// ============================================================
+//  STATS
+// ============================================================
 function showStats(chatId,userId){
     const d=stats[userId],rate=d.total?((d.win/d.total)*100).toFixed(1):"0.0";
     const bar="🟦".repeat(d.total?Math.round(d.win/d.total*10):0)+"⬜".repeat(d.total?10-Math.round(d.win/d.total*10):10);
@@ -1412,7 +1442,7 @@ if(text==="🔢 Set Watch Losses"){
             if(running[id])return send(msg.chat.id,"⚠️ Already running!");
 
             running[id]=true;sentPeriods[id]=new Set();
-            autobetState[id]={level:1,consecutiveLoss:0,inMart:false};
+            autobetState[id]={level:1,consecutiveLoss:0,inMart:false,isWaiting:false,nextStartTime:null};
 
             // Load previous B/S history from API
             const prevList = await fetchList();
@@ -1432,7 +1462,7 @@ if(text==="🔢 Set Watch Losses"){
             );
             runPredict(id,msg.chat.id);
         }
-        if(text==="🛑 Stop")   {running[id]=false;send(msg.chat.id,"🛑 Stopped.");}
+        if(text==="🛑 Stop")   { running[id]=false; clearUserTimers(id); predictionPromises.delete(id); sentPeriods[id]?.clear(); send(msg.chat.id,"🛑 Stopped."); }
         if(text==="📊 Stats")  showStats(msg.chat.id,id);
         if(text==="💰 Profit") profitReport(msg.chat.id,id);
         if(text==="📩 Contact") send(msg.chat.id,"📩 "+ADMIN_HANDLE+"\nID: "+id);
