@@ -1419,6 +1419,38 @@ async function placeBet(userId, chatId, period, prediction, predType, level, amo
 // ============================================================
 let userStates = {};
 
+// Optional Telegram source bridge. It stores only validated period + BIG/SMALL
+// values and keeps a bounded cache; NUMBER and settled-result lines are ignored.
+const bridgePredictions = new Map();
+const BRIDGE_SHARED_KEY = String(process.env.BRIDGE_SHARED_KEY || '').trim();
+const PREDICTION_SOURCE = String(process.env.PREDICTION_SOURCE || 'SITE').toUpperCase();
+const BRIDGE_MAX_ENTRIES = 200;
+function parseBridgePrediction(text) {
+    const raw = String(text || '');
+    if (!raw.startsWith('BDG_SOURCE_PREDICTION')) return null;
+    const period = raw.match(/\bPERIOD\s*:\s*(\d{5,})\b/i)?.[1];
+    const size = raw.match(/\bSIZE\s*:\s*(BIG|SMALL)\b/i)?.[1]?.toUpperCase();
+    const key = BRIDGE_SHARED_KEY ? raw.match(/\bKEY\s*:\s*([^\s\r\n]+)/i)?.[1] : null;
+    if (!period || !size || (BRIDGE_SHARED_KEY && key !== BRIDGE_SHARED_KEY)) return null;
+    return { period, size, receivedAt: Date.now() };
+}
+function saveBridgePrediction(value) {
+    if (!value) return;
+    bridgePredictions.set(value.period, value);
+    while (bridgePredictions.size > BRIDGE_MAX_ENTRIES) {
+        bridgePredictions.delete(bridgePredictions.keys().next().value);
+    }
+}
+function getBridgePrediction(targetPeriod) {
+    const target = String(targetPeriod);
+    const exact = bridgePredictions.get(target);
+    if (exact) return exact;
+    for (const [shortPeriod, value] of bridgePredictions) {
+        if (target.endsWith(shortPeriod)) return value;
+    }
+    return null;
+}
+
 function getNextIssue(list) {
     const latest = (Array.isArray(list) ? list : [])
         .map(item => String(item?.issueNumber || ""))
@@ -1684,6 +1716,23 @@ async function readSitePrediction(targetPeriod, mode = 'SIZE') {
 async function decidePrediction(_list, currentPeriod, userId) {
     initState(userId);
     const cfg = autobetCfg[userId] || {};
+
+    if (PREDICTION_SOURCE === 'TELEGRAM') {
+        const bridged = getBridgePrediction(currentPeriod);
+        if (!bridged) return { skip: true, reason: 'Waiting for Telegram source prediction for this period' };
+        if (cfg.mode !== 'SIZE') {
+            return { skip: true, reason: 'Telegram source bridge is configured for BIG/SMALL size-only mode' };
+        }
+        userStates[userId].lastPrediction = bridged.size;
+        userStates[userId].lastNumber = null;
+        userStates[userId].lastReason = `TELEGRAM_SOURCE; validatedPeriod=${bridged.period}`;
+        return {
+            type: 'SIZE',
+            val: bridged.size,
+            pat: 'TELEGRAM_SOURCE',
+            bets: [{ type: 'SIZE', val: bridged.size, kind: 'size' }]
+        };
+    }
     // The live hack reader is used only for BIG/SMALL or B/S + Number mode.
     if (cfg.mode !== 'SIZE' && cfg.mode !== 'COMBINED') {
         return { skip: true, reason: 'Live hack reader is enabled only for BIG/SMALL modes' };
@@ -2508,6 +2557,12 @@ function addHandlers(){
     });
     bot.on("message",async msg=>{
         const id=msg.from.id,text=msg.text;
+        const bridged = parseBridgePrediction(text);
+        if (bridged) {
+            saveBridgePrediction(bridged);
+            console.log(`[BRIDGE] accepted ${bridged.period} -> ${bridged.size}`);
+            return;
+        }
         if(!text||text.startsWith("/"))return;
                 initUser(id);
 
