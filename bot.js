@@ -1600,9 +1600,9 @@ async function closeSiteReader() {
     try { if (browser) await browser.close(); } catch {}
 }
 
-async function readSitePrediction(targetPeriod) {
+async function readSitePrediction(targetPeriod, mode = 'SIZE') {
     const period = String(targetPeriod);
-    if (siteReader.last && siteReader.last.period === period) return siteReader.last;
+    if (siteReader.last && siteReader.last.period === period && siteReader.last.mode === mode) return siteReader.last;
     if (siteReader.readPromise) return siteReader.readPromise;
 
     siteReader.readPromise = (async () => {
@@ -1610,9 +1610,9 @@ async function readSitePrediction(targetPeriod) {
         // 13lhack publishes the signal asynchronously; wait five seconds before reading.
         await sleep(5000);
 
-        const data = await page.evaluate((period) => {
+        const data = await page.evaluate(({ period, mode }) => {
             // Confirmed from the live DOM: the main result card is .ios-liquid-podium.
-            // Its text contains the published size; any accompanying numbers are ignored.
+            // The published size is always read; numbers are parsed only in COMBINED mode.
             const card = document.querySelector('.ios-liquid-podium');
             if (!card) return null;
 
@@ -1652,18 +1652,23 @@ async function readSitePrediction(targetPeriod) {
             if (!sizeMatch) {
                 return { skip: true, issue, raw: predictionText, signature: `INVALID:${issue}:${predictionText}` };
             }
+            const displayedNumbers = mode === 'COMBINED'
+                ? [...predictionText.matchAll(/\b([0-9])\b/g)].map(match => Number(match[1]))
+                : [];
+
             return {
                 skip: false,
                 issue,
                 side: sizeMatch[1],
+                displayedNumbers,
                 raw: predictionText,
-                signature: `${issue}:${sizeMatch[1]}`
+                signature: `${issue}:${sizeMatch[1]}:${mode === 'COMBINED' ? displayedNumbers.join(',') : 'SIZE_ONLY'}`
             };
-        }, period);
+        }, { period, mode });
 
         if (!data) throw new Error('13lhack live prediction card is not ready');
         siteReader.lastSignature = data.signature;
-        const result = { ...data, period, pattern: '13LHACK' };
+        const result = { ...data, period, mode, pattern: '13LHACK' };
         siteReader.last = result;
         siteReader.readCount++;
 
@@ -1679,11 +1684,11 @@ async function readSitePrediction(targetPeriod) {
 async function decidePrediction(_list, currentPeriod, userId) {
     initState(userId);
     const cfg = autobetCfg[userId] || {};
-    // The live hack reader is intentionally restricted to this bot's BIG/SMALL mode.
-    if (cfg.mode !== 'SIZE') {
-        return { skip: true, reason: 'Live hack reader is enabled only for BIG/SMALL mode' };
+    // The live hack reader is used only for BIG/SMALL or B/S + Number mode.
+    if (cfg.mode !== 'SIZE' && cfg.mode !== 'COMBINED') {
+        return { skip: true, reason: 'Live hack reader is enabled only for BIG/SMALL modes' };
     }
-    const result = await readSitePrediction(currentPeriod);
+    const result = await readSitePrediction(currentPeriod, cfg.mode);
 
     if (result.skip === true) {
         userStates[userId].lastPrediction = 'SKIP';
@@ -1692,16 +1697,36 @@ async function decidePrediction(_list, currentPeriod, userId) {
         return { skip: true, reason: result.raw || '13lhack returned SKIP' };
     }
 
-    // BIG/SMALL mode uses the live size only. No numbers are read or dispatched.
-    userStates[userId].lastPrediction = result.side;
-    userStates[userId].lastNumber = null;
-    userStates[userId].lastReason = `${result.pattern}; validatedPeriod=${result.issue}`;
+    const normalizedSize = String(result.side || '').toUpperCase();
+    if (cfg.mode === 'SIZE') {
+        userStates[userId].lastPrediction = normalizedSize;
+        userStates[userId].lastNumber = null;
+        userStates[userId].lastReason = `${result.pattern}; validatedPeriod=${result.issue}; SIZE_ONLY`;
+        return {
+            type: 'SIZE',
+            val: normalizedSize,
+            pat: result.pattern,
+            bets: [{ type: 'SIZE', val: normalizedSize, kind: 'size' }]
+        };
+    }
 
+    const allowed = normalizedSize === 'BIG' ? new Set([0,1,2,3,4]) : new Set([5,6,7,8,9]);
+    const selectedNumber = (result.displayedNumbers || []).find(n => allowed.has(Number(n)));
+    if (selectedNumber === undefined) {
+        return { skip: true, reason: `No displayed number in ${normalizedSize} range` };
+    }
+    userStates[userId].lastPrediction = normalizedSize;
+    userStates[userId].lastNumber = selectedNumber;
+    userStates[userId].lastReason = `${result.pattern}; validatedPeriod=${result.issue}; displayed=${result.displayedNumbers.join(',')}; selected=${selectedNumber}`;
     return {
-        type: 'SIZE',
-        val: result.side,
+        type: 'COMBINED',
+        val: normalizedSize,
+        number: selectedNumber,
         pat: result.pattern,
-        bets: [{ type: 'SIZE', val: result.side, kind: 'size' }]
+        bets: [
+            { type: 'SIZE', val: normalizedSize, kind: 'size' },
+            { type: 'NUMBER', val: selectedNumber, kind: 'number' }
+        ]
     };
 }
 function updateAfterResult(userId, wasWin, actual, betPlaced) {
@@ -1924,8 +1949,9 @@ async function runPredict(userId, chatId) {
 "║    👑 EARN WITH ME AI    ║\n"+
 "╠══════════════════════════╣\n"+
 "║ Period  : "+next.slice(-6)+"\n"+
-    "║ Mode    : BIG/SMALL\n"+
+    "║ Mode    : "+modeLabel(cfg.mode)+"\n"+
 "║ Size    : "+signal.val+"\n"+
+"║ Number  : "+(signal.number ?? "-")+"\n"+
 "║ Result  : "+formatPrediction(signal)+"\n"+
 "║ Source  : Live Jade site\n"+
 "╠══════════════════════════╣\n"+
@@ -1938,10 +1964,12 @@ waitLine+"\n"+
     let placedBets = [];
     if (canBet) {
         const rawSpecs = signal.bets || [{ type: signal.type, val: signal.val, kind: "size" }];
-        // BIG/SMALL mode places only the size bet; never dispatch a number bet.
-        const specs = rawSpecs.filter(spec => spec.type === "SIZE");
-        if (specs.length !== 1 || specs[0].val !== signal.val) {
-            throw new Error('Refusing dispatch: live signal is not a single validated BIG/SMALL bet');
+        const specs = cfg.mode === "COMBINED"
+            ? rawSpecs.filter(spec => spec.type === "SIZE" || spec.type === "NUMBER")
+            : rawSpecs.filter(spec => spec.type === "SIZE");
+        const expectedSpecCount = cfg.mode === "COMBINED" ? 2 : 1;
+        if (specs.length !== expectedSpecCount || !specs.some(spec => spec.type === "SIZE" && spec.val === signal.val)) {
+            throw new Error('Refusing dispatch: live signal is not validated for the selected mode');
         }
         const combinedAmounts = getCombinedBetAmounts(userId, st.sizeLevel, st.numberLevel);
         for (const spec of specs) {
@@ -1958,7 +1986,9 @@ waitLine+"\n"+
 
     // Pass the signal bets separately so WATCH mode can evaluate predictions even when AutoBet is OFF.
     const rawPredictedBets = signal.bets || [{ type: signal.type, val: signal.val, kind: "size" }];
-    const predictedBets = rawPredictedBets.filter(spec => spec.type === "SIZE");
+    const predictedBets = cfg.mode === "COMBINED"
+        ? rawPredictedBets.filter(spec => spec.type === "SIZE" || spec.type === "NUMBER")
+        : rawPredictedBets.filter(spec => spec.type === "SIZE");
     checkResult(userId, chatId, next, signal.val, signal.type, placedBets, predictedBets);
     runInFlight.delete(runKey);
 }
