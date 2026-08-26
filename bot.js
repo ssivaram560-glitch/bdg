@@ -1568,7 +1568,7 @@ async function ensureSitePage() {
         await page.waitForFunction(() => {
             const card = document.querySelector('.ios-liquid-podium');
             const periodNode = [...document.querySelectorAll('div,section,article')]
-                .filter(el => /#\d{8,}/.test(el.innerText || '') && /\b\d{2}:\d{2}\b/.test(el.innerText || ''))
+                .filter(el => /#\d{5,}/.test(el.innerText || '') && /\b\d{2}:\d{2}\b/.test(el.innerText || ''))
                 .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
             return Boolean(card && /\b(?:BIG|SMALL)\b/i.test(card.innerText || '') && periodNode);
         }, { timeout: 30000, polling: 250 });
@@ -1619,17 +1619,24 @@ async function readSitePrediction(targetPeriod) {
             const predictionText = (card.innerText || '')
                 .replace(/\s+/g, ' ').trim().toUpperCase();
             const periodNode = [...document.querySelectorAll('div,section,article')]
-                .filter(el => /#\d{8,}/.test(el.innerText || '') && /\b\d{2}:\d{2}\b/.test(el.innerText || ''))
+                .filter(el => /#\d{5,}/.test(el.innerText || '') && /\b\d{2}:\d{2}\b/.test(el.innerText || ''))
                 .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
-            const livePeriodMatch = (periodNode?.innerText || '').match(/#(\d{8,})/);
+            // The hack page shows the short issue suffix (#10905), while the
+            // draw API returns the full issue (20260826100010905). Accept only
+            // an exact match or an exact full-period suffix match.
+            const livePeriodMatch = (periodNode?.innerText || '').match(/#(\d{5,})/);
             const livePeriod = livePeriodMatch ? livePeriodMatch[1] : '';
-            if (!livePeriod || livePeriod !== String(period)) {
+            const expectedPeriod = String(period);
+            const periodMatches = Boolean(livePeriod) &&
+                (livePeriod === expectedPeriod ||
+                 (livePeriod.length >= 5 && expectedPeriod.endsWith(livePeriod)));
+            if (!periodMatches) {
                 return {
                     skip: true,
                     issue: livePeriod,
-                    expectedPeriod: String(period),
-                    raw: `PERIOD_MISMATCH live=${livePeriod || '-'} expected=${period}`,
-                    signature: `PERIOD_MISMATCH:${livePeriod}:${period}`
+                    expectedPeriod,
+                    raw: `PERIOD_MISMATCH live=${livePeriod || '-'} expected=${expectedPeriod}`,
+                    signature: `PERIOD_MISMATCH:${livePeriod}:${expectedPeriod}`
                 };
             }
             const issue = livePeriod;
