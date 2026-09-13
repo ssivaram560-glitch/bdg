@@ -1,3 +1,13 @@
+/*
+ * Updated full source: BIG/SMALL majority-minority rotation enabled.
+ *
+ * SIZE mode behavior:
+ *   - First prediction: majority side in the latest 10 results.
+ *   - WIN: keep the same majority/minority state.
+ *   - LOSS: rotate to the opposite side for the next prediction.
+ * NUMBER and COMBINED modes keep their existing selection logic.
+ */
+
 const TelegramBot = require('node-telegram-bot-api');
 const axios       = require('axios');
 const crypto      = require('crypto');
@@ -1645,8 +1655,23 @@ function buildBSFromList(list, count = 15) {
 }
 
 function initState(userId) {
-    if (!userStates[userId]) userStates[userId] = { lastSitePrediction: null, resultHistory: [] };
-    if (!Array.isArray(userStates[userId].resultHistory)) userStates[userId].resultHistory = [];
+    if (!userStates[userId]) {
+        userStates[userId] = {
+            lastSitePrediction: null,
+            resultHistory: [],
+            // 0 = majority side, 1 = minority side.
+            // This changes only after a loss in SIZE mode.
+            rotationStep: 0,
+            currentRotationSide: null,
+            lastPredictionWon: null
+        };
+    }
+    if (!Array.isArray(userStates[userId].resultHistory)) {
+        userStates[userId].resultHistory = [];
+    }
+    if (!Number.isInteger(userStates[userId].rotationStep)) {
+        userStates[userId].rotationStep = 0;
+    }
 }
 
 function modeLabel(mode) {
@@ -1882,6 +1907,97 @@ function numberPrediction(lastResult, historyResults = []) {
         number: selected.mapping[1],
         mode: selected.mode,
         decisionReason: selected.decisionReason
+    };
+}
+
+// ============================================================
+// BIG/SMALL MAJORITY -> WIN SAME STATE -> LOSS ROTATE LOGIC
+// ============================================================
+// The most recent `count` results are counted. The first prediction
+// uses the majority side. A WIN keeps the same majority/minority state.
+// A LOSS toggles the state, so the next prediction uses the opposite side.
+// This is intentionally used only in SIZE mode; NUMBER/COMBINED logic
+// remains unchanged.
+function getMajorityMinoritySide(historyResults, count = 10) {
+    if (!Array.isArray(historyResults) || historyResults.length === 0) {
+        return null;
+    }
+
+    let bigCount = 0;
+    let smallCount = 0;
+
+    for (const item of historyResults.slice(0, count)) {
+        const n = latestResultNumber(item);
+        if (n === null) continue;
+
+        if (n >= 5) bigCount++;
+        else smallCount++;
+    }
+
+    const total = bigCount + smallCount;
+    if (total === 0) return null;
+
+    let majority;
+    if (bigCount > smallCount) {
+        majority = 'BIG';
+    } else if (smallCount > bigCount) {
+        majority = 'SMALL';
+    } else {
+        // Deterministic tie-breaker: use the latest valid result.
+        const latest = latestResultNumber(historyResults[0]);
+        majority = latest !== null && latest >= 5 ? 'BIG' : 'SMALL';
+    }
+
+    return {
+        majority,
+        minority: majority === 'BIG' ? 'SMALL' : 'BIG',
+        bigCount,
+        smallCount,
+        total
+    };
+}
+
+function getRotatingBigSmallPrediction(userId, historyResults) {
+    initState(userId);
+
+    const sides = getMajorityMinoritySide(historyResults, 10);
+    if (!sides) {
+        return {
+            skip: true,
+            reason: 'Not enough valid BIG/SMALL history'
+        };
+    }
+
+    const state = userStates[userId];
+    const rotationStep = Number(state.rotationStep || 0) % 2;
+    const useMajority = rotationStep === 0;
+    const prediction = useMajority ? sides.majority : sides.minority;
+
+    state.currentRotationSide = prediction;
+    state.lastPrediction = prediction;
+    state.lastNumberPrediction = null;
+    state.lastSelectionMode = useMajority ? 'MAJORITY' : 'MINORITY';
+
+    const confidence = Math.round(
+        Math.max(sides.bigCount, sides.smallCount) / sides.total * 100
+    );
+
+    return {
+        type: 'SIZE',
+        val: prediction,
+        conf: confidence,
+        pat: 'MAJORITY_MINOR_ROTATION',
+        mode: 'MAJORITY_MINOR_ROTATION',
+        rotationStep,
+        majority: sides.majority,
+        minority: sides.minority,
+        bigCount: sides.bigCount,
+        smallCount: sides.smallCount,
+        pattern: `${sides.majority}:${sides.bigCount} | ${sides.minority}:${sides.smallCount}`,
+        decisionReason:
+            `BIG=${sides.bigCount}, SMALL=${sides.smallCount}; ` +
+            `${useMajority ? 'majority' : 'minority'} selected`,
+        bets: [{ type: 'SIZE', val: prediction, kind: 'size' }]
     };
 }
 
@@ -2178,26 +2294,24 @@ async function decidePrediction(list, currentPeriod, userId) {
     if (latest === null) return { skip: true, reason: 'API returned no valid latest result' };
 
     if (cfgForPredictionMode(userId) === 'SIZE') {
-        const patternDecision = getPatternModeAndPrediction(history);
-        if (!patternDecision) return { skip: true, reason: 'API returned no valid Big/Small history' };
-        if (patternDecision.skip === true) return patternDecision;
-        userStates[userId].lastPrediction = patternDecision.prediction;
-        userStates[userId].lastNumberPrediction = null;
+        // SIZE mode uses majority first. A win keeps the current state;
+        // a loss toggles to the opposite side for the next prediction.
+        const rotationDecision = getRotatingBigSmallPrediction(userId, history);
+        if (!rotationDecision || rotationDecision.skip === true) {
+            return rotationDecision || {
+                skip: true,
+                reason: 'Unable to calculate majority/minority'
+            };
+        }
+
         userStates[userId].lastPredictionNumber = latest;
-        userStates[userId].lastSelectionMode = patternDecision.mode;
-        userStates[userId].lastNRPattern = patternDecision.pattern;
-        console.log(`[NR PATTERN] ${patternDecision.pattern} | ${patternDecision.reason} -> ${patternDecision.prediction}`);
-        return {
-            type: 'SIZE',
-            val: patternDecision.prediction,
-            conf: 90,
-            pat: patternDecision.mode,
-            mode: patternDecision.mode,
-            pattern: patternDecision.pattern,
-            matchedPattern: patternDecision.matchedPattern,
-            decisionReason: patternDecision.reason,
-            bets: [{ type: 'SIZE', val: patternDecision.prediction, kind: 'size' }]
-        };
+        console.log(
+            `[ROTATION] BIG=${rotationDecision.bigCount}, ` +
+            `SMALL=${rotationDecision.smallCount} | ` +
+            `Step=${rotationDecision.rotationStep} | ` +
+            `Prediction=${rotationDecision.val}`
+        );
+        return rotationDecision;
     }
 
     const selected = getPredictionSelection(latest, history);
@@ -2243,6 +2357,14 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
             if (wasWin) {
                 st.lastWinLevel = st.level;
                 st.lastWinMode = cfg.mode || "SIZE";
+
+                if (cfg.mode === "SIZE") {
+                    initState(userId);
+                    // WIN: keep the current majority/minority state.
+                    // rotationStep is deliberately not changed here.
+                    userStates[userId].lastPredictionWon = true;
+                }
+
                 st.level = 1;
                 st.sizeLevel = 1;
                 st.numberLevel = 1;
@@ -2251,6 +2373,18 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
                 st.lossStreakHitRecorded = false;
             }
             else {
+                if (cfg.mode === "SIZE") {
+                    initState(userId);
+                    // LOSS: toggle majority <-> minority for next round.
+                    userStates[userId].lastPredictionWon = false;
+                    userStates[userId].rotationStep =
+                        (Number(userStates[userId].rotationStep || 0) + 1) % 2;
+                    console.log(
+                        `[ROTATION LOSS] Next prediction uses ` +
+                        `${userStates[userId].rotationStep === 0 ? 'MAJORITY' : 'MINORITY'}`
+                    );
+                }
+
                 st.consecutiveLoss++;
                 const maxLevel = Math.max(1, Number(cfg.maxLvl) || 1);
                 const currentLevel = Math.min(maxLevel, Math.max(1, Number(st.level) || 1));
