@@ -1,11 +1,11 @@
 /*
- * Updated full source: BIG/SMALL majority-minority rotation enabled.
+ * Full source updated without majority/minority analysis.
  *
- * SIZE mode behavior:
- *   - First prediction: majority side in the latest 10 results.
- *   - WIN: keep the same majority/minority state.
- *   - LOSS: rotate to the opposite side for the next prediction.
- * NUMBER and COMBINED modes keep their existing selection logic.
+ * SIZE mode:
+ *   1. First signal comes from the original formula + N/R pattern logic.
+ *   2. WIN keeps the current BIG/SMALL state.
+ *   3. LOSS toggles BIG <-> SMALL for the next prediction.
+ * NUMBER and COMBINED modes are unchanged.
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -1659,18 +1659,19 @@ function initState(userId) {
         userStates[userId] = {
             lastSitePrediction: null,
             resultHistory: [],
-            // 0 = majority side, 1 = minority side.
-            // This changes only after a loss in SIZE mode.
-            rotationStep: 0,
-            currentRotationSide: null,
+            // Existing formula/N-R prediction is used first.
+            // After that, SIZE mode keeps the signal on WIN and toggles
+            // BIG <-> SMALL only after LOSS.
+            rotationSide: null,
+            rotationInitialized: false,
             lastPredictionWon: null
         };
     }
     if (!Array.isArray(userStates[userId].resultHistory)) {
         userStates[userId].resultHistory = [];
     }
-    if (!Number.isInteger(userStates[userId].rotationStep)) {
-        userStates[userId].rotationStep = 0;
+    if (typeof userStates[userId].rotationInitialized !== 'boolean') {
+        userStates[userId].rotationInitialized = false;
     }
 }
 
@@ -1907,97 +1908,6 @@ function numberPrediction(lastResult, historyResults = []) {
         number: selected.mapping[1],
         mode: selected.mode,
         decisionReason: selected.decisionReason
-    };
-}
-
-// ============================================================
-// BIG/SMALL MAJORITY -> WIN SAME STATE -> LOSS ROTATE LOGIC
-// ============================================================
-// The most recent `count` results are counted. The first prediction
-// uses the majority side. A WIN keeps the same majority/minority state.
-// A LOSS toggles the state, so the next prediction uses the opposite side.
-// This is intentionally used only in SIZE mode; NUMBER/COMBINED logic
-// remains unchanged.
-function getMajorityMinoritySide(historyResults, count = 10) {
-    if (!Array.isArray(historyResults) || historyResults.length === 0) {
-        return null;
-    }
-
-    let bigCount = 0;
-    let smallCount = 0;
-
-    for (const item of historyResults.slice(0, count)) {
-        const n = latestResultNumber(item);
-        if (n === null) continue;
-
-        if (n >= 5) bigCount++;
-        else smallCount++;
-    }
-
-    const total = bigCount + smallCount;
-    if (total === 0) return null;
-
-    let majority;
-    if (bigCount > smallCount) {
-        majority = 'BIG';
-    } else if (smallCount > bigCount) {
-        majority = 'SMALL';
-    } else {
-        // Deterministic tie-breaker: use the latest valid result.
-        const latest = latestResultNumber(historyResults[0]);
-        majority = latest !== null && latest >= 5 ? 'BIG' : 'SMALL';
-    }
-
-    return {
-        majority,
-        minority: majority === 'BIG' ? 'SMALL' : 'BIG',
-        bigCount,
-        smallCount,
-        total
-    };
-}
-
-function getRotatingBigSmallPrediction(userId, historyResults) {
-    initState(userId);
-
-    const sides = getMajorityMinoritySide(historyResults, 10);
-    if (!sides) {
-        return {
-            skip: true,
-            reason: 'Not enough valid BIG/SMALL history'
-        };
-    }
-
-    const state = userStates[userId];
-    const rotationStep = Number(state.rotationStep || 0) % 2;
-    const useMajority = rotationStep === 0;
-    const prediction = useMajority ? sides.majority : sides.minority;
-
-    state.currentRotationSide = prediction;
-    state.lastPrediction = prediction;
-    state.lastNumberPrediction = null;
-    state.lastSelectionMode = useMajority ? 'MAJORITY' : 'MINORITY';
-
-    const confidence = Math.round(
-        Math.max(sides.bigCount, sides.smallCount) / sides.total * 100
-    );
-
-    return {
-        type: 'SIZE',
-        val: prediction,
-        conf: confidence,
-        pat: 'MAJORITY_MINOR_ROTATION',
-        mode: 'MAJORITY_MINOR_ROTATION',
-        rotationStep,
-        majority: sides.majority,
-        minority: sides.minority,
-        bigCount: sides.bigCount,
-        smallCount: sides.smallCount,
-        pattern: `${sides.majority}:${sides.bigCount} | ${sides.minority}:${sides.smallCount}`,
-        decisionReason:
-            `BIG=${sides.bigCount}, SMALL=${sides.smallCount}; ` +
-            `${useMajority ? 'majority' : 'minority'} selected`,
-        bets: [{ type: 'SIZE', val: prediction, kind: 'size' }]
     };
 }
 
@@ -2294,24 +2204,53 @@ async function decidePrediction(list, currentPeriod, userId) {
     if (latest === null) return { skip: true, reason: 'API returned no valid latest result' };
 
     if (cfgForPredictionMode(userId) === 'SIZE') {
-        // SIZE mode uses majority first. A win keeps the current state;
-        // a loss toggles to the opposite side for the next prediction.
-        const rotationDecision = getRotatingBigSmallPrediction(userId, history);
-        if (!rotationDecision || rotationDecision.skip === true) {
-            return rotationDecision || {
-                skip: true,
-                reason: 'Unable to calculate majority/minority'
-            };
+        // Keep the original file's formula + N/R pattern prediction as the
+        // first signal. Do not calculate majority/minority here.
+        const patternDecision = getPatternModeAndPrediction(history);
+        if (!patternDecision) {
+            return { skip: true, reason: 'API returned no valid Big/Small history' };
+        }
+        if (patternDecision.skip === true) return patternDecision;
+
+        const state = userStates[userId];
+        const originalPrediction = patternDecision.prediction;
+
+        // First round: use the original formula/N-R prediction.
+        // Later rounds: keep the state after WIN; after LOSS the state was
+        // already toggled by updateAfterResult().
+        if (!state.rotationInitialized || !state.rotationSide) {
+            state.rotationSide = originalPrediction;
+            state.rotationInitialized = true;
         }
 
-        userStates[userId].lastPredictionNumber = latest;
+        const finalPrediction = state.rotationSide;
+        state.lastPrediction = finalPrediction;
+        state.lastNumberPrediction = null;
+        state.lastPredictionNumber = latest;
+        state.lastSelectionMode = 'EXISTING_LOGIC_ROTATION';
+        state.lastNRPattern = patternDecision.pattern;
+
+        const rotationReason =
+            `${patternDecision.reason}; existing signal=${originalPrediction}; ` +
+            `rotation state=${finalPrediction}`;
+
         console.log(
-            `[ROTATION] BIG=${rotationDecision.bigCount}, ` +
-            `SMALL=${rotationDecision.smallCount} | ` +
-            `Step=${rotationDecision.rotationStep} | ` +
-            `Prediction=${rotationDecision.val}`
+            `[EXISTING LOGIC ROTATION] ` +
+            `${patternDecision.pattern} | ${rotationReason}`
         );
-        return rotationDecision;
+
+        return {
+            type: 'SIZE',
+            val: finalPrediction,
+            conf: patternDecision.conf ?? 90,
+            pat: patternDecision.mode,
+            mode: 'EXISTING_LOGIC_ROTATION',
+            pattern: patternDecision.pattern,
+            matchedPattern: patternDecision.matchedPattern,
+            originalPrediction,
+            decisionReason: rotationReason,
+            bets: [{ type: 'SIZE', val: finalPrediction, kind: 'size' }]
+        };
     }
 
     const selected = getPredictionSelection(latest, history);
@@ -2360,8 +2299,7 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
 
                 if (cfg.mode === "SIZE") {
                     initState(userId);
-                    // WIN: keep the current majority/minority state.
-                    // rotationStep is deliberately not changed here.
+                    // WIN: retain the current prediction state.
                     userStates[userId].lastPredictionWon = true;
                 }
 
@@ -2375,13 +2313,20 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
             else {
                 if (cfg.mode === "SIZE") {
                     initState(userId);
-                    // LOSS: toggle majority <-> minority for next round.
-                    userStates[userId].lastPredictionWon = false;
-                    userStates[userId].rotationStep =
-                        (Number(userStates[userId].rotationStep || 0) + 1) % 2;
+                    const state = userStates[userId];
+
+                    // LOSS: toggle only BIG <-> SMALL. The next round does
+                    // not use majority/minority and does not recalculate a
+                    // new prediction formula; it rotates the existing signal.
+                    if (state.rotationSide === 'BIG') {
+                        state.rotationSide = 'SMALL';
+                    } else if (state.rotationSide === 'SMALL') {
+                        state.rotationSide = 'BIG';
+                    }
+                    state.lastPredictionWon = false;
+
                     console.log(
-                        `[ROTATION LOSS] Next prediction uses ` +
-                        `${userStates[userId].rotationStep === 0 ? 'MAJORITY' : 'MINORITY'}`
+                        `[EXISTING LOGIC LOSS] Next SIZE prediction: ${state.rotationSide || 'existing logic first signal'}`
                     );
                 }
 
