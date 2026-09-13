@@ -651,9 +651,8 @@ const BET_URL     = "https://api.ar-lottery01.com/api/Lottery/WinGoBet";
 const LOGIN_URL   = "https://api.tashanrfv.com/api/webapi/Login";
 const CAPTCHA_URL = "https://13llottery.com/api/Home/Captcha";
 const API_URL     = "https://luciferapi.com";
-// Same live source used by the Netlify prediction page. The bot polls this
-// JSON endpoint; it never refreshes the webpage and keeps only bounded state.
-const DRAW_URL    = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json";
+// All result history and formula calculations must come from Lucifer API.
+const DRAW_URL    = "https://luciferapi.com";
 const SITE_URL    = "https://13lwin19.com";
 const LOGIN_PAGE_URL = "https://13lwin19.com/login";
 const CHROME_ARGS = [
@@ -2002,11 +2001,11 @@ function getPatternModeAndPrediction(historyResults) {
         (Number(latestResult) >= 5 ? 'BIG' : 'SMALL');
 
     const { pattern, calculations } = buildNormalRecoveryPattern(list);
-    // Current pattern is only the latest 5-10 calculated N/R tokens.
+    // Current pattern is searched from 10 down to 4 calculated N/R tokens.
     let currentLength = Math.min(10, pattern.length);
     let currentPattern = pattern.slice(0, currentLength).join('');
     let nextTokens = [];
-    for (let candidateLength = currentLength; candidateLength >= 5; candidateLength--) {
+    for (let candidateLength = currentLength; candidateLength >= 4; candidateLength--) {
         const candidatePattern = pattern.slice(0, candidateLength).join('');
         const candidateTokens = [];
         for (let start = candidateLength; start < pattern.length; start++) {
@@ -2019,6 +2018,13 @@ function getPatternModeAndPrediction(historyResults) {
             nextTokens = candidateTokens;
             break;
         }
+    }
+
+    if (!nextTokens.length) {
+        return {
+            skip: true,
+            reason: `Latest pattern ${currentPattern || 'NONE'} not found in Lucifer old history from 10 down to 4 tokens`
+        };
     }
 
     const normalCount = nextTokens.filter(token => token === 'N').length;
@@ -2041,9 +2047,7 @@ function getPatternModeAndPrediction(historyResults) {
         formulaAccuracy: calculations.length ? calculations.filter(row => row.token === 'N').length / calculations.length : 0,
         voteConfidence: majorityConfidence,
         calculations,
-        reason: occurrences
-            ? `Latest ${currentLength}-token pattern ${currentPattern}; old matches N:${normalCount} R:${recoveryCount}; majority ${majorityToken} -> ${mode}`
-            : `Latest ${currentLength}-token pattern ${currentPattern || 'NONE'} not found; formula NORMAL fallback`
+        reason: `Latest ${currentLength}-token pattern ${currentPattern}; old matches N:${normalCount} R:${recoveryCount}; majority ${majorityToken} -> ${mode}`
     };
 }
 
@@ -2176,6 +2180,7 @@ async function decidePrediction(list, currentPeriod, userId) {
     if (cfgForPredictionMode(userId) === 'SIZE') {
         const patternDecision = getPatternModeAndPrediction(history);
         if (!patternDecision) return { skip: true, reason: 'API returned no valid Big/Small history' };
+        if (patternDecision.skip === true) return patternDecision;
         userStates[userId].lastPrediction = patternDecision.prediction;
         userStates[userId].lastNumberPrediction = null;
         userStates[userId].lastPredictionNumber = latest;
