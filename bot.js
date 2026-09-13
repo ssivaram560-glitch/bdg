@@ -1998,46 +1998,52 @@ function getPatternModeAndPrediction(historyResults) {
     const list = Array.isArray(historyResults) ? historyResults : [];
     const latestPeriod = String(list[0]?.issueNumber ?? list[0]?.issue ?? '');
     const latestResult = latestResultNumber(list[0]);
-    const normalPrediction = formulaSizePrediction(latestPeriod, latestResult);
-    if (!normalPrediction) return null;
+    const normalPrediction = formulaSizePrediction(latestPeriod, latestResult) ||
+        (Number(latestResult) >= 5 ? 'BIG' : 'SMALL');
 
     const { pattern, calculations } = buildNormalRecoveryPattern(list);
-    const evidence = findValidatedPattern(pattern, calculations);
-    if (!evidence) return null;
-    const mode = evidence.mode;
-    const patternPrediction = mode === 'RECOVERY'
+    // Current pattern is only the latest 5-10 calculated N/R tokens.
+    let currentLength = Math.min(10, pattern.length);
+    let currentPattern = pattern.slice(0, currentLength).join('');
+    let nextTokens = [];
+    for (let candidateLength = currentLength; candidateLength >= 5; candidateLength--) {
+        const candidatePattern = pattern.slice(0, candidateLength).join('');
+        const candidateTokens = [];
+        for (let start = candidateLength; start < pattern.length; start++) {
+            const historical = pattern.slice(start, start + candidateLength).join('');
+            if (historical === candidatePattern && pattern[start - 1]) candidateTokens.push(pattern[start - 1]);
+        }
+        if (candidateTokens.length) {
+            currentLength = candidateLength;
+            currentPattern = candidatePattern;
+            nextTokens = candidateTokens;
+            break;
+        }
+    }
+
+    const normalCount = nextTokens.filter(token => token === 'N').length;
+    const recoveryCount = nextTokens.filter(token => token === 'R').length;
+    const majorityToken = recoveryCount > normalCount ? 'R' : 'N';
+    const mode = majorityToken === 'R' ? 'RECOVERY' : 'NORMAL';
+    const finalPrediction = mode === 'RECOVERY'
         ? (normalPrediction === 'BIG' ? 'SMALL' : 'BIG')
         : normalPrediction;
-    const sameResultSignal = getHistoricalSameResultSignal(list, latestResult);
-    const formulaAccuracy = calculations.length
-        ? calculations.filter(row => row.token === 'N').length / calculations.length
-        : 0;
-    const votes = [normalPrediction, patternPrediction];
-    if (sameResultSignal && sameResultSignal.confidence >= FORMULA_PATTERN_MIN_CONFIDENCE) {
-        votes.push(sameResultSignal.prediction);
-    }
-    const voteCounts = votes.reduce((acc, value) => {
-        acc[value] = (acc[value] || 0) + 1;
-        return acc;
-    }, {});
-    const finalPrediction = Object.keys(voteCounts).sort((a, b) => voteCounts[b] - voteCounts[a])[0];
-    const voteConfidence = voteCounts[finalPrediction] / votes.length;
-    if (voteConfidence < (votes.length >= 3 ? 2 / 3 : 1) || formulaAccuracy < FORMULA_PATTERN_MIN_CONFIDENCE) {
-        return null;
-    }
+    const occurrences = nextTokens.length;
+    const majorityConfidence = occurrences ? Math.max(normalCount, recoveryCount) / occurrences : 0;
     return {
         mode,
         prediction: finalPrediction,
-        pattern: pattern.join(''),
-        matchedPattern: evidence.matchedPattern,
-        occurrences: evidence.occurrences,
-        confidence: evidence.confidence,
-        recentConfidence: evidence.recentConfidence,
-        formulaAccuracy,
-        sameResultSignal,
-        voteConfidence,
+        pattern: currentPattern || pattern.join(''),
+        matchedPattern: occurrences ? `${currentPattern}→${majorityToken}` : 'NO_OLD_MATCH',
+        occurrences,
+        confidence: majorityConfidence,
+        recentConfidence: majorityConfidence,
+        formulaAccuracy: calculations.length ? calculations.filter(row => row.token === 'N').length / calculations.length : 0,
+        voteConfidence: majorityConfidence,
         calculations,
-        reason: `Validated ${evidence.matchedPattern} -> ${mode}; votes ${votes.join('/')}; final ${finalPrediction}`
+        reason: occurrences
+            ? `Latest ${currentLength}-token pattern ${currentPattern}; old matches N:${normalCount} R:${recoveryCount}; majority ${majorityToken} -> ${mode}`
+            : `Latest ${currentLength}-token pattern ${currentPattern || 'NONE'} not found; formula NORMAL fallback`
     };
 }
 
@@ -2168,8 +2174,6 @@ async function decidePrediction(list, currentPeriod, userId) {
     if (latest === null) return { skip: true, reason: 'API returned no valid latest result' };
 
     if (cfgForPredictionMode(userId) === 'SIZE') {
-        // Previous result 0: do not generate a Big/Small prediction.
-        if (latest === 0) return { skip: true, reason: 'Previous result is 0' };
         const patternDecision = getPatternModeAndPrediction(history);
         if (!patternDecision) return { skip: true, reason: 'API returned no valid Big/Small history' };
         userStates[userId].lastPrediction = patternDecision.prediction;
