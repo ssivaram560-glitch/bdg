@@ -2074,8 +2074,8 @@ function decidePrediction(list, currentLevel, userId) {
             prediction = prediction === 'SMALL' ? 'BIG' : 'SMALL';
         }
         predictionMode = 'RECOVERY';
-        decisionReason = `3+ consecutive losses; pasted logic ${recovery.reason}` +
-            (state.mode === 'RECOVERY' ? ' + recovery opposite' : '');
+        decisionReason = `3+ consecutive losses; ${state.mode} calculation ${recovery.reason}` +
+            (state.mode === 'RECOVERY' ? ' + recovery opposite' : ' original result');
     } else {
         // BS/SB => opposite of the latest result; BB/SS => same as the latest result.
         prediction = pair.prediction;
@@ -2116,23 +2116,22 @@ function recordLossStreakHit(userId) {
 function getModeFromHistory(state) {
     const history = Array.isArray(state.history) ? state.history : [];
     const histStr = history.join(',');
-    const lossStreak = Number(state.lossStreak) || 0;
 
-    // pasted_content_2.txt history patterns.
+    // These are the pasted_content_2.txt history rules.
     const recoveryPattern = histStr.endsWith('W,W,L') ||
                             histStr.endsWith('W,W,W,L') ||
                             /(L,L,L,L+)/.test(histStr);
     const normalPattern = histStr.endsWith('W,L') ||
                           /(W,W,W,W+),L$/.test(histStr);
 
-    // Three consecutive losses switch the prediction engine to pasted logic.
-    // History still decides whether that pasted logic is NORMAL or RECOVERY.
-    if (lossStreak >= 3) state.pastedMode = true;
+    // Before the first 3-loss trigger, mode is irrelevant because the bot uses
+    // the BB/SS/BS/SB same/opposite engine.
     if (!state.pastedMode) return 'NORMAL';
     if (recoveryPattern) return 'RECOVERY';
     if (normalPattern) return 'NORMAL';
 
-    // Once pasted mode is active, preserve the analysed mode until a win.
+    // A W at the end closes the previous loss sequence: W,L,L,W is NORMAL.
+    if (history[history.length - 1] === 'W') return 'NORMAL';
     return state.mode === 'RECOVERY' ? 'RECOVERY' : 'NORMAL';
 }
 
@@ -2145,19 +2144,20 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
     if (!Number.isInteger(state.lossStreak)) state.lossStreak = 0;
 
     state.history.push(wasWin ? 'W' : 'L');
-    if (wasWin) {
-        // Any win exits pasted mode. The next prediction returns to BS/SB/BB/SS.
-        state.lossStreak = 0;
-        state.pastedMode = false;
-        state.mode = 'NORMAL';
-    } else {
-        state.lossStreak++;
-        const previousMode = state.mode || 'NORMAL';
-        state.mode = getModeFromHistory(state);
-        console.log(`[PREDICTION-2] history=${state.history.join(',')} | lossStreak=${state.lossStreak} | mode=${previousMode}->${state.mode} | pasted=${state.pastedMode}`);
+    if (wasWin) state.lossStreak = 0;
+    else state.lossStreak++;
+
+    // Three losses only activate the pasted calculation engine. They do not
+    // directly decide NORMAL/RECOVERY; old W/L history decides that mode.
+    if (!state.pastedMode && state.lossStreak >= 3) {
+        state.pastedMode = true;
+        console.log('[PREDICTION-2] 3-loss trigger: pasted calculation engine ON');
     }
 
+    const previousMode = state.mode || 'NORMAL';
+    state.mode = getModeFromHistory(state);
     if (state.history.length > 20) state.history.shift();
+    console.log(`[PREDICTION-2] history=${state.history.join(',')} | mode=${previousMode}->${state.mode} | pasted=${state.pastedMode}`);
 
     // Existing AutoBet level/martingale bookkeeping remains unchanged.
     if (typeof autobetState !== 'undefined' && autobetState[userId]) {
